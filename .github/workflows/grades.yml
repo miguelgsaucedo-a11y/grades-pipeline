@@ -1,0 +1,23 @@
+name: weekly-grades
+on:
+  schedule:
+    - cron: "0 19 * * 6"   # Saturdays 12:00 PM PT (19:00 UTC)
+  workflow_dispatch: {}     # allow manual run
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Scrape & append to Google Sheet
+        env:
+          PORTAL_USER: ${{ secrets.PORTAL_USER }}
+          PORTAL_PASS: ${{ secrets.PORTAL_PASS }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          STUDENTS: "Adrian,Jacob"
+        run: python main.py
