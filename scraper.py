@@ -1,5 +1,5 @@
 # scraper.py
-# Login → Student tile → Assignments → per-class "Print Progress Report" PDF → parse with pdfplumber.
+# Login -> set student -> Assignments -> build PrintProgressReport URL per class -> fetch PDF -> parse via pdfplumber
 
 from playwright.sync_api import sync_playwright
 from datetime import datetime
@@ -11,47 +11,42 @@ from urllib.parse import urljoin
 
 BASE = "https://parentportal.cajonvalley.net/"
 
-TILE_ID = {
-    "adrian": "357342",
-    "jacob":  "357354",
+# Use the data-stuuniq values from your HTML (NOT the 357342/357354 image ids)
+STUUNIQ = {
+    "adrian": "1547500",
+    "jacob":  "1546467",
 }
 
-ASSIGNMENTS_HEADER_RE = re.compile(r'^Per:\s*(\S+)\s+(.*)$', re.I)
 WS = re.compile(r"\s+")
 
+
 def _norm(s):
-    if s is None: return ""
+    if s is None:
+        return ""
     s = str(s).replace("\xa0", " ")
     return WS.sub(" ", s).strip()
+
 
 def _first(root, sel):
     try:
         loc = root.locator(sel).first
-        if loc.is_visible(): return loc
+        if loc.is_visible():
+            return loc
     except:
         pass
     return None
 
-def _click(root, sel):
-    el = _first(root, sel)
-    if el:
-        el.click()
-        return True
-    return False
 
-def _wait_visible(root, sel, timeout=8000):
+def _wait_visible(root, sel, timeout=10000):
     try:
         root.locator(sel).first.wait_for(state="visible", timeout=timeout)
         return True
     except:
         return False
 
-def _all_roots(page):
-    return [page] + list(page.frames)
 
 # ---------------- PDF parsing ----------------
-
-def parse_progress_pdf(pdf_bytes, default_student=""):
+def parse_progress_pdf(pdf_bytes, default_student="", course_hint="", period_hint="", teacher_hint=""):
     """
     Returns list of dict rows with keys matching our Sheet header.
     Extracts: Student, Period, Course, Teacher, DueDate, AssignedDate, Assignment,
@@ -60,28 +55,23 @@ def parse_progress_pdf(pdf_bytes, default_student=""):
     rows = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         student = default_student
-        period = ""
-        course = ""
-        teacher = ""
+        period = period_hint
+        course = course_hint
+        teacher = teacher_hint
+
         for page in pdf.pages:
             text = page.extract_text() or ""
-            # Header lines like:
-            # Student: Gonzalez-Cuevas, Jacob (357354)
-            # Class: T4256YF1-782 Coding 1
-            # Period: 2
-            # Teacher: Russo, M
             for ln in text.splitlines():
                 ln_n = _norm(ln)
                 if ln_n.startswith("Student:"):
                     student = _norm(ln_n.split(":", 1)[1])
-                if ln_n.startswith("Class:"):
+                elif ln_n.startswith("Class:"):
                     course = _norm(ln_n.split(":", 1)[1])
-                if ln_n.startswith("Period:"):
+                elif ln_n.startswith("Period:"):
                     period = _norm(ln_n.split(":", 1)[1])
-                if ln_n.startswith("Teacher:"):
+                elif ln_n.startswith("Teacher:"):
                     teacher = _norm(ln_n.split(":", 1)[1])
 
-            # Extract tables; use line strategies to keep columns straight
             tables = page.extract_tables({
                 "vertical_strategy": "lines",
                 "horizontal_strategy": "lines",
@@ -92,7 +82,6 @@ def parse_progress_pdf(pdf_bytes, default_student=""):
                 if not tbl or len(tbl) < 2:
                     continue
                 header = [_norm(h) for h in tbl[0]]
-                # Heuristic: look for "Assignment" in header row
                 if not any("Assignment" in h for h in header):
                     continue
 
@@ -103,36 +92,42 @@ def parse_progress_pdf(pdf_bytes, default_student=""):
                                 return i
                     return None
 
-                c_cat  = idx("Category")
                 c_due  = idx("Date Due", "Due Date")
+                c_asgd = idx("Assigned", "Date Assigned")
                 c_asgn = idx("Assignment")
-                c_poss = idx("Pts Possible", "Possible", "Pos")
+                c_poss = idx("Pts Possible", "Possible")
                 c_sc   = idx("Score")
                 c_pct  = idx("Pct Score", "Pct")
-                c_asgd = idx("Assigned", "Date Assigned")
                 c_comm = idx("Comments", "Comment")
 
                 for r in tbl[1:]:
-                    cells = [ _norm(x) for x in r ]
+                    cells = [_norm(x) for x in r]
                     if not cells or all(not x for x in cells):
                         continue
+
                     assign = cells[c_asgn] if c_asgn is not None and c_asgn < len(cells) else ""
                     if not assign or assign.lower() == "assignment":
                         continue
+
                     due   = cells[c_due]  if c_due  is not None and c_due  < len(cells) else ""
                     asgd  = cells[c_asgd] if c_asgd is not None and c_asgd < len(cells) else ""
                     poss  = cells[c_poss] if c_poss is not None and c_poss < len(cells) else ""
                     sc    = cells[c_sc]   if c_sc   is not None and c_sc   < len(cells) else ""
                     pct   = cells[c_pct]  if c_pct  is not None and c_pct  < len(cells) else ""
                     comm  = cells[c_comm] if c_comm is not None and c_comm < len(cells) else ""
-                    # Flags
+
                     flags = []
                     if "missing" in comm.lower() or sc == "0" or pct == "0":
                         flags.append("Missing")
                     try:
-                        pct_val = float(pct)
-                        if pct_val < 70: flags.append("Low")
-                        if pct_val >= 95: flags.append("Win")
+                        if pct.endswith("%"):
+                            pct_val = float(pct.replace("%", ""))
+                        else:
+                            pct_val = float(pct)
+                        if pct_val < 70:
+                            flags.append("Low")
+                        if pct_val >= 95:
+                            flags.append("Win")
                     except:
                         pass
 
@@ -154,123 +149,120 @@ def parse_progress_pdf(pdf_bytes, default_student=""):
                     })
     return rows
 
-# --------------- scrape via PDFs ----------------
 
-def run_scrape(pin, password, students=("Adrian","Jacob")):
+# --------------- main scrape ----------------
+def run_scrape(pin, password, students=("Adrian", "Jacob")):
+    """
+    Returns a list of row dicts ready for Google Sheets.
+    """
     all_rows = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(accept_downloads=True, base_url=BASE)
         page = ctx.new_page()
 
-        # Login on the root page you shared
+        # Login
         page.goto("/", wait_until="domcontentloaded")
         print("DEBUG — landed:", page.url)
 
-        _wait_visible(page, "#Pin", 12000)
-        _wait_visible(page, "#Password", 12000)
+        _wait_visible(page, "#Pin", 15000)
+        _wait_visible(page, "#Password", 15000)
         page.fill("#Pin", str(pin))
         page.fill("#Password", str(password))
-        _click(page, "#LoginButton")
+        page.click("#LoginButton")
         page.wait_for_load_state("domcontentloaded"); sleep(0.8)
 
-        # Ensure we can reach the picker
+        # Ensure we're on the main portal page
         page.goto("/Home/PortalMainPage", wait_until="domcontentloaded"); sleep(0.6)
 
         for s in students:
-            sid = TILE_ID.get(s.lower())
-            if not sid:
-                print(f"DEBUG — no tile id mapping for {s}, skipping"); continue
+            key = s.strip().lower()
+            stuuniq = STUUNIQ.get(key)
+            if not stuuniq:
+                print(f"DEBUG — no STUUNIQ mapping for {s}, skipping")
+                continue
 
-            # Click student tile
-            clicked = _click(page, f"#stuTile_{sid}")
-            print(f"DEBUG — clicked tile for {s}: {clicked}")
-            page.wait_for_load_state("domcontentloaded"); sleep(0.6)
+            # Switch the active student directly
+            page.goto(f"/StudentBanner/SetStudentBanner/{stuuniq}", wait_until="domcontentloaded")
+            page.goto("/Home/PortalMainPage", wait_until="domcontentloaded"); sleep(0.6)
 
-            # Click Assignments (left menu lives in page; no cross-origin frames)
-            # It's a <td class="td2_action">Assignments</td>
-            # Search across main + frames just in case.
-            clicked_assign = False
-            for root in _all_roots(page):
-                if _click(root, "td.td2_action:has-text('Assignments')"):
-                    clicked_assign = True
-                    break
-            print("DEBUG — clicked Assignments:", clicked_assign)
-            page.wait_for_load_state("domcontentloaded"); sleep(0.6)
+            # Assignments area exists on the page; find tables
+            if not _wait_visible(page, "#SP_Assignments", 8000):
+                print(f"DEBUG — Assignments container not visible for {s}")
+                continue
 
-            # Find all "print" icons for classes on the Assignments view.
-            # They are typically <a> wrapping an <img> whose src/title mentions print.
-            print_icons = []
-            for root in _all_roots(page):
-                try:
-                    anchors = root.locator(
-                        "xpath=//a[.//img[contains(translate(@src,'PRINT','print'),'print') or "
-                        "contains(translate(@title,'PRINT','print'),'print')]]"
-                    )
-                    cnt = anchors.count()
-                    for i in range(cnt):
-                        el = anchors.nth(i)
-                        if el.is_visible():
-                            print_icons.append((root, el))
-                except:
-                    pass
+            tbls = page.locator("#SP_Assignments table[id^='tblAssign_']")
+            count = tbls.count()
+            print(f"DEBUG — class tables for {s}: {count}")
 
-            print(f"DEBUG — print icons found for {s}: {len(print_icons)}")
+            for i in range(count):
+                tbl = tbls.nth(i)
 
-            # For each class: open the modal, grab the "Print Progress Report" href, fetch the PDF, parse.
-            for idx, (root, a) in enumerate(print_icons):
-                try:
-                    a.click()
-                except:
+                # mstuniq is in the id "tblAssign_<mstuniq>"
+                tid = tbl.get_attribute("id") or ""
+                m = re.search(r"tblAssign_(\d+)", tid)
+                if not m:
                     continue
+                mstuniq = m.group(1)
 
-                # Wait for the "Progress Report Terms" modal to appear
-                modal_root = None
-                for rr in _all_roots(page):
-                    if _wait_visible(rr, "xpath=//div[contains(.,'Progress Report Terms')]", timeout=3000):
-                        modal_root = rr; break
+                # Get period/course/teacher hints from the table content
+                period = ""
+                course = ""
+                teacher = ""
 
-                if not modal_root:
-                    # try a generic dialog selector
-                    for rr in _all_roots(page):
-                        if _wait_visible(rr, "xpath=//a[contains(.,'Print Progress Report')]", timeout=2000):
-                            modal_root = rr; break
+                # Caption text has "Per : X   Course (Code)"
+                cap = _first(tbl, "caption")
+                if cap:
+                    cap_text = cap.inner_text()
+                    cap_text = _norm(cap_text)
+                    # Try to split "Per : X   <course>"
+                    if "Per" in cap_text:
+                        try:
+                            after = cap_text.split("Per", 1)[1]
+                            after = after.split(":", 1)[1]
+                            parts = after.split(None, 1)  # ["X", "Course..."]
+                            period = parts[0]
+                            if len(parts) > 1:
+                                course = parts[1]
+                        except:
+                            pass
 
-                if not modal_root:
-                    print("DEBUG — modal not found; skipping one class")
-                    continue
+                # Teacher anchor has aria-label starting with "Teacher:"
+                a_teacher = _first(tbl, "a[aria-label^='Teacher:']")
+                if a_teacher:
+                    teacher = _norm(a_teacher.inner_text())
 
-                # Prefer the first row (usually "Trimester 1 Progress")
-                link = _first(modal_root, "xpath=(//a[contains(.,'Print Progress Report')])[1]")
-                if not link:
-                    print("DEBUG — 'Print Progress Report' link not visible; skipping")
-                    continue
+                # The hidden input inside header carries the term code, e.g., TP1
+                termc = ""
+                hid = _first(tbl, "input[id^='showmrktermc_']")
+                if hid:
+                    termc = (hid.get_attribute("value") or "").strip()
 
-                href = link.get_attribute("href")
-                if not href:
-                    print("DEBUG — no href on link; skipping")
-                    continue
+                if not termc:
+                    # Safe default, but log it
+                    print(f"DEBUG — term code missing for mstuniq={mstuniq}; defaulting TP1")
+                    termc = "TP1"
 
-                pdf_url = urljoin(BASE, href)
-                # Fetch with session cookies via context.request
+                pdf_path = f"/Home/PrintProgressReport/{mstuniq}^{termc}"
+                pdf_url = urljoin(BASE, pdf_path)
+
                 resp = ctx.request.get(pdf_url)
-                if resp.ok:
-                    pdf_bytes = resp.body()
-                    rows = parse_progress_pdf(pdf_bytes, default_student=s)
-                    print(f"DEBUG — parsed rows from class {idx+1} for {s}: {len(rows)}")
-                    all_rows.extend(rows)
-                else:
-                    print(f"DEBUG — PDF request failed status={resp.status} url={pdf_url}")
+                if not resp.ok:
+                    print(f"DEBUG — PDF GET failed {resp.status} for {pdf_url}")
+                    continue
 
-                # Close modal (X button or ESC)
-                closed = _click(modal_root, "css=button, .ui-dialog-titlebar-close, .close") or _click(page, "text=×")
-                if not closed:
-                    try: page.keyboard.press("Escape")
-                    except: pass
-                sleep(0.3)
-
-            # Back to picker for next student
-            page.goto("/Home/PortalMainPage", wait_until="domcontentloaded"); sleep(0.5)
+                pdf_bytes = resp.body()
+                rows = parse_progress_pdf(
+                    pdf_bytes,
+                    default_student=s,
+                    course_hint=course,
+                    period_hint=period,
+                    teacher_hint=teacher,
+                )
+                print(f"DEBUG — parsed rows for {s}, class mstuniq={mstuniq}: {len(rows)}")
+                all_rows.extend(rows)
 
         browser.close()
+
     return all_rows
