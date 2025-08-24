@@ -1,233 +1,278 @@
-from __future__ import annotations
-
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 import re
-from datetime import date
-from typing import List, Dict, Tuple
+from datetime import datetime
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+PORTAL_URL = "https://parentportal.cajonvalley.net/"
 
-BASE_URL = "https://parentportal.cajonvalley.net"
-
-# --------- utilities --------- #
-def dprint(*args):
-    print("DEBUG —", *args, flush=True)
-
-
-def norm_students(students_csv_or_list) -> list[str]:
-    """Accepts 'Adrian,Jacob' or ['Adrian','Jacob'] or ('Adrian','Jacob')."""
-    if isinstance(students_csv_or_list, (list, tuple, set)):
-        return [str(s).strip() for s in students_csv_or_list if str(s).strip()]
-    return [s.strip() for s in str(students_csv_or_list or "").split(",") if s.strip()]
-
-
-def pct_to_float(text: str) -> float | None:
-    m = re.search(r"(\d+(?:\.\d+)?)\s*%", text or "")
-    return float(m.group(1)) if m else None
-
-
-def cell_text_safe(locator) -> str:
-    try:
-        return locator.inner_text().strip()
-    except PWTimeoutError:
+def _text(el):
+    if not el:
         return ""
+    try:
+        return el.inner_text().strip()
     except Exception:
         return ""
 
+def _first(el, selector):
+    try:
+        return el.query_selector(selector)
+    except Exception:
+        return None
 
-# --------- core page helpers --------- #
-def login(page, username: str, password: str) -> None:
-    """
-    Land on /, fill #Pin and #Password, click #LoginButton and wait for portal shell.
-    """
-    dprint("landed:", f"{BASE_URL}/")
-    page.goto(f"{BASE_URL}/", wait_until="domcontentloaded")
-
+def login_and_wait(page, username, password):
+    page.goto(PORTAL_URL, wait_until="domcontentloaded")
     pin = page.locator("#Pin")
-    pwd = page.locator("#Password")
-    btn = page.locator("#LoginButton")
+    pw = page.locator("#Password")
 
-    pin.wait_for(state="visible", timeout=20000)
-    pwd.wait_for(state="visible", timeout=20000)
-    dprint("login fields visible:", True, True)
+    pin_visible = pin.is_visible(timeout=10000)
+    pw_visible = pw.is_visible(timeout=10000)
+    print(f"DEBUG – login fields visible: {pin_visible} {pw_visible}")
 
     pin.fill(username)
-    pwd.fill(password)
-    btn.click()
+    pw.fill(password)
+    page.click("#LoginButton")
 
-    page.wait_for_url(re.compile(r"/Home/PortalMainPage"), timeout=30000)
-    page.wait_for_selector("#SP-MainDiv", timeout=30000)
-    dprint("after login: portal loaded")
+    # Wait until the portal furniture is present
+    page.wait_for_selector("#divStudentBanner", timeout=30000)
+    print("DEBUG – after login: portal loaded")
 
+def show_student_tiles(page):
+    # Tiles are behind the "family" icon / header cell with id=openSelect
+    # If not visible, click to open.
+    tiles_container = page.locator("#divSelectStudent")
+    if tiles_container.is_visible():
+        return True
+    page.locator("#openSelect").click()
+    try:
+        page.wait_for_selector(".studentTile", timeout=10000)
+        return True
+    except PWTimeout:
+        return False
 
-def build_student_map(page) -> Dict[str, Tuple[str, str]]:
+def build_student_tile_map(page):
     """
-    Build a map of names to (stuuniq, sid).
-      - stuuniq: value used in SetStudentBanner URL (data-stuuniq)
-      - sid: the numeric student id reflected in #hStudentID and in tile id suffix
-    We map nickname, full name, and a convenient first name token.
+    Returns: dict keyed by lowercase nickname -> {
+        'tile_id': '357342',            # from id suffix stuTile_357342
+        'selector': '#stuTile_357342'
+    }
     """
-    page.wait_for_selector("#divStudentBanner", timeout=20000)
+    ok = show_student_tiles(page)
+    print(f"DEBUG – saw student tiles: {ok}")
+    mapping = {}
 
-    tiles = page.locator("#divSelectStudent .studentTile")
-    count = tiles.count()
+    if not ok:
+        return mapping
 
-    m: Dict[str, Tuple[str, str]] = {}
-    for i in range(count):
-        t = tiles.nth(i)
-        stuuniq = t.get_attribute("data-stuuniq") or ""
-        tile_id = t.get_attribute("id") or ""
-        # tile id is like "stuTile_357342" -> capture the numeric piece
-        sid_match = re.search(r"stuTile_(\d+)", tile_id)
-        sid = sid_match.group(1) if sid_match else ""
+    tiles = page.query_selector_all(".studentTile")
+    for t in tiles:
+        tile_id_full = t.get_attribute("id") or ""          # e.g. stuTile_357342
+        tile_id_num = tile_id_full.split("_")[-1]
+        nick_el = t.query_selector(".tileStudentNickname")
+        nickname = (_text(nick_el)).lower()
+        if nickname:
+            mapping[nickname] = {
+                "tile_id": tile_id_num,
+                "selector": f"#{tile_id_full}"
+            }
+    return mapping
 
-        nick = cell_text_safe(t.locator(".tileStudentNickname"))
-        full_name = cell_text_safe(t.locator(".tileStudentName"))
+def current_student_banner_id(page):
+    """The hidden #hStudentID holds the numeric banner ID (e.g. 357342)."""
+    try:
+        return page.eval_on_selector("#hStudentID", "el => el.value")
+    except Exception:
+        return None
 
-        if not (stuuniq and sid):
-            continue
-
-        if nick:
-            m[nick] = (stuuniq, sid)
-        if full_name:
-            m[full_name] = (stuuniq, sid)
-            # also map a handy first token if it helps
-            first = full_name.split(",")[-1].strip() if "," in full_name else full_name.split()[0]
-            if first:
-                m.setdefault(first, (stuuniq, sid))
-
-    dprint("saw student tiles:", bool(m))
-    return m
-
-
-def set_student(page, stuuniq: str, expect_sid: str) -> None:
+def switch_to_student(page, nickname, tile_map):
     """
-    Switch the active student using stuuniq in the URL, then wait for #hStudentID to show sid.
+    Switches to the student whose tile nickname matches `nickname` (case-insensitive).
+    Uses the exact SetStudentBanner flow the page binds to .studentTile clicks.
     """
-    page.goto(f"{BASE_URL}/StudentBanner/SetStudentBanner/{stuuniq}", wait_until="domcontentloaded")
-    page.wait_for_selector(f'#hStudentID[value="{expect_sid}"]', timeout=15000)
+    target = tile_map.get(nickname.lower())
+    if not target:
+        print(f"DEBUG – could not find tile for {nickname}")
+        return False
 
+    target_id = target["tile_id"]  # this should match #hStudentID after switch
+    cur_id = current_student_banner_id(page)
 
-def ensure_assignments_loaded(page) -> None:
+    # If we're already on that student, treat as success.
+    if cur_id == target_id:
+        print(f"DEBUG – already on student {nickname} (id {target_id})")
+        # Close the tile picker if it's open
+        if page.locator("#divSelectStudent").is_visible():
+            page.locator("#openSelect").click()
+        return True
+
+    # Ensure tiles visible, then click the tile
+    show_student_tiles(page)
+    page.click(target["selector"])
+
+    # Wait until #hStudentID reflects the chosen tile id
+    try:
+        page.wait_for_function(
+            """(id) => document.querySelector('#hStudentID') && document.querySelector('#hStudentID').value === id""",
+            arg=target_id,
+            timeout=15000
+        )
+        # Close the tile picker if it remained open
+        if page.locator("#divSelectStudent").is_visible():
+            page.locator("#openSelect").click()
+        print(f"DEBUG – switched to student {nickname}")
+        return True
+    except PWTimeout:
+        print(f"DEBUG – failed to switch to student {nickname}")
+        return False
+
+def ensure_assignments_visible(page):
     """
-    The 'Assignments' section content is placed in #SP_Assignments when loaded.
+    Click the left menu 'Assignments' if needed and wait for tables to appear.
     """
-    page.wait_for_selector("#SP-MainDiv", timeout=15000)
-    page.wait_for_selector("#SP_Assignments", timeout=20000)
-    dprint("nav_root for Assignments exists:", True)
-    page.wait_for_timeout(250)
+    # The menu row has id=Assignments; clicking toggles its panel
+    menu_row = page.locator("tr#Assignments")
+    if menu_row.count() == 0:
+        return False
 
+    # Make sure the content div exists
+    content_root = page.locator("#SP_Assignments")
+    if not content_root.is_visible():
+        menu_row.click()
 
-def parse_assignments_for_student(page, student_name: str) -> List[List[str]]:
+    # Wait for tables or a clear sign of empty content
+    try:
+        page.wait_for_selector("#SP_Assignments", timeout=10000)
+    except PWTimeout:
+        return False
+
+    # Force panel open (sometimes already selected; clicking image toggles)
+    try:
+        hdr_toggle = page.locator("#img_Assignments")
+        if hdr_toggle.count() > 0 and "collapse" not in (hdr_toggle.get_attribute("src") or "").lower():
+            menu_row.click()
+    except Exception:
+        pass
+
+    # Give the panel a moment to render dynamic body
+    page.wait_for_timeout(500)
+
+    return True
+
+PCT_RE = re.compile(r"(\d+(?:\.\d+)?)%")
+
+def extract_assignments_for_student(page, student_name):
     """
-    Scrape per-class tables inside #SP_Assignments.
-    Returns: [date, student, course, due_date, assignment, score_pct, category]
+    Returns (rows, counts)
+      rows: list[list] -> [timestamp, student, course, assignment, due_date, pct, status]
+      counts: dict with 'flags' (missing+low) and 'wins'
     """
-    ensure_assignments_loaded(page)
+    ok = ensure_assignments_visible(page)
+    if not ok:
+        print(f"DEBUG – Assignments panel not visible for {student_name}")
+        return [], {"flags": 0, "wins": 0}
 
-    root = page.locator("#SP_Assignments")
-    tables = root.locator('table[id^="tblAssign_"]')
-    tcount = tables.count()
+    tables = page.query_selector_all("#SP_Assignments table.tblassign")
+    print(f"DEBUG – class tables for {student_name}: {len(tables)}")
 
-    out_rows: List[List[str]] = []
-    today = date.today().isoformat()
+    out_rows = []
+    missing_or_low = 0
+    wins = 0
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    for ti in range(tcount):
-        tbl = tables.nth(ti)
+    for tbl in tables:
+        # Course from caption text (e.g., "Per: 2  CC Math 6 (T2201YF1)")
+        cap = _first(tbl, "caption")
+        course_text = _text(cap)
+        if course_text:
+            # Normalize "Per: X ..." -> just keep after the colon
+            if "Per" in course_text and ":" in course_text:
+                course = course_text.split(":", 1)[1].strip()
+            else:
+                course = course_text
+        else:
+            course = ""
 
-        course = cell_text_safe(tbl.locator("caption")).strip()
-        course = re.sub(r"^\s*Per\s*:\s*\S+\s*", "", course)
-
-        body_rows = tbl.locator("tbody > tr")
-        for ri in range(body_rows.count()):
-            r = body_rows.nth(ri)
-
-            if "No Assignments" in r.inner_text():
+        # Rows in <tbody>
+        rows = tbl.query_selector_all("tbody > tr")
+        for tr in rows:
+            tr_text = _text(tr)
+            if "No Assignments Available" in tr_text:
                 continue
 
-            cls = r.get_attribute("class") or ""
-            is_missing = "missingAssignment" in cls
+            tr_class = (tr.get_attribute("class") or "").lower()
+            is_missing = "missingassignment" in tr_class
 
-            tds = r.locator("td")
+            # Grab useful cells by IDs if present
+            due_el = _first(tr, 'td[id^="ddate"]')
+            desc_el = _first(tr, 'td[id^="descript"]')
+            due_date = _text(due_el)
+            assignment = _text(desc_el)
 
-            due = ""
-            assign = ""
-            pct_txt = ""
+            # Try to find a percentage cell anywhere in the row
+            pct = ""
+            for td in tr.query_selector_all("td"):
+                m = PCT_RE.search(_text(td))
+                if m:
+                    pct = m.group(1)
+                    break
 
-            ddate_el = r.locator('td[id^="ddate"]')
-            desc_el = r.locator('td[id^="descript"]')
-
-            if ddate_el.count() > 0:
-                due = cell_text_safe(ddate_el)
-            elif tds.count() >= 2:
-                due = cell_text_safe(tds.nth(1))
-
-            if desc_el.count() > 0:
-                assign = cell_text_safe(desc_el)
-            elif tds.count() >= 4:
-                assign = cell_text_safe(tds.nth(3))
-
-            if tds.count() >= 7:
-                pct_txt = cell_text_safe(tds.nth(6))
-
-            pct_val = pct_to_float(pct_txt)
-            category = "OK"
+            status = ""
             if is_missing:
-                category = "MISSING"
-            elif pct_val is None or pct_val == 0:
-                category = "LOW"
-            elif pct_val < 70:
-                category = "LOW"
-            elif pct_val >= 90:
-                category = "WIN"
+                status = "MISSING"
+                missing_or_low += 1
+            elif pct:
+                try:
+                    p = float(pct)
+                    if p >= 90.0:
+                        status = "WIN"
+                        wins += 1
+                    elif p < 70.0:
+                        status = "LOW"
+                        missing_or_low += 1
+                except Exception:
+                    pass  # leave status empty if pct parsing fails
 
-            out_rows.append([today, student_name, course, due, assign, (pct_txt or "").strip(), category])
+            if status:
+                out_rows.append([ts, student_name, course, assignment, due_date, pct, status])
 
-    return out_rows
+    return out_rows, {"flags": missing_or_low, "wins": wins}
 
-
-# --------- public entrypoint --------- #
-def run_scrape(username: str, password: str, students_csv_or_list) -> List[List[str]]:
+def run_scrape(username, password, students):
     """
-    - Logs in
-    - Resolves requested student names to (stuuniq, sid)
-    - For each, switches active student and scrapes Assignments
+    Orchestrates login, per-student switching, and scraping.
+    Returns (rows, metrics)
     """
-    students = norm_students(students_csv_or_list)
-    all_rows: List[List[str]] = []
+    all_rows = []
+    total_flags = 0
+    total_wins = 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(ignore_https_errors=True)
+        browser = p.chromium.launch(headless=True, args=[
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ])
+        context = browser.new_context()
         page = context.new_page()
-        page.set_default_timeout(20000)
+        page.set_default_timeout(15000)
 
-        try:
-            login(page, username, password)
-        except PWTimeoutError as e:
-            dprint("login failed (timeout):", str(e))
-            browser.close()
-            return all_rows
+        # 1) Login
+        login_and_wait(page, username, password)
 
-        stu_map = build_student_map(page)
+        # 2) Get the student tiles map once; it persists across switches
+        tile_map = build_student_tile_map(page)
 
-        for student in students:
-            # case-insensitive key match
-            entry = next((v for k, v in stu_map.items() if k.lower() == student.lower()), None)
-            if not entry:
-                dprint("tile not found for", student)
+        # 3) Walk each requested student
+        for s in students:
+            switched = switch_to_student(page, s, tile_map)
+            if not switched:
+                print(f"DEBUG – failed to switch to student {s}")
                 continue
 
-            stuuniq, sid = entry
-            try:
-                set_student(page, stuuniq, sid)
-            except PWTimeoutError:
-                dprint("failed to switch to student", student)
-                continue
+            rows, counts = extract_assignments_for_student(page, s)
+            all_rows.extend(rows)
+            total_flags += counts.get("flags", 0)
+            total_wins += counts.get("wins", 0)
 
-            student_rows = parse_assignments_for_student(page, student)
-            dprint("scraped rows for", f"{student}:", len(student_rows))
-            all_rows.extend(student_rows)
-
+        context.close()
         browser.close()
 
-    return all_rows
+    return all_rows, {"flags": total_flags, "wins": total_wins}
