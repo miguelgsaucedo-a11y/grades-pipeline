@@ -1,57 +1,50 @@
 # scraper.py
-# Login -> set student -> Assignments -> build PrintProgressReport URL per class -> fetch PDF -> parse via pdfplumber
+# Login -> find portal iframe -> set student -> scrape class tables -> fetch PDFs -> parse with pdfplumber
 
 from playwright.sync_api import sync_playwright
 from datetime import datetime
-import re
-import io
-import pdfplumber
-from time import sleep
 from urllib.parse import urljoin
+import pdfplumber, io, re, time
 
 BASE = "https://parentportal.cajonvalley.net/"
 
-# Use the data-stuuniq values from your HTML (NOT the 357342/357354 image ids)
+# Use data-stuuniq values from your HTML
 STUUNIQ = {
     "adrian": "1547500",
     "jacob":  "1546467",
 }
 
+# expected banner ids for sanity-check after switching students
+EXPECTED_HSTUDENTID = {
+    "adrian": "357342",
+    "jacob":  "357354",
+}
+
 WS = re.compile(r"\s+")
 
 
-def _norm(s):
+def _norm(s: str) -> str:
     if s is None:
         return ""
-    s = str(s).replace("\xa0", " ")
-    return WS.sub(" ", s).strip()
+    return WS.sub(" ", str(s).replace("\xa0", " ")).strip()
 
 
-def _first(root, sel):
-    try:
-        loc = root.locator(sel).first
-        if loc.is_visible():
-            return loc
-    except:
-        pass
-    return None
-
-
-def _wait_visible(root, sel, timeout=10000):
-    try:
-        root.locator(sel).first.wait_for(state="visible", timeout=timeout)
-        return True
-    except:
-        return False
+def get_portal_frame(page):
+    """
+    Return the iframe that actually contains the PortalMainPage content.
+    If none found, fall back to the page itself.
+    """
+    # Give the frame a moment to appear
+    time.sleep(0.4)
+    for fr in page.frames:
+        u = (fr.url or "")
+        if "/Home/PortalMainPage" in u or "parentportal.cajonvalley.net" in u:
+            return fr
+    return page
 
 
 # ---------------- PDF parsing ----------------
 def parse_progress_pdf(pdf_bytes, default_student="", course_hint="", period_hint="", teacher_hint=""):
-    """
-    Returns list of dict rows with keys matching our Sheet header.
-    Extracts: Student, Period, Course, Teacher, DueDate, AssignedDate, Assignment,
-              PtsPossible, Score, Pct, Status, Comments.
-    """
     rows = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         student = default_student
@@ -85,20 +78,20 @@ def parse_progress_pdf(pdf_bytes, default_student="", course_hint="", period_hin
                 if not any("Assignment" in h for h in header):
                     continue
 
-                def idx(*names):
+                def col(*names):
                     for i, h in enumerate(header):
                         for n in names:
                             if re.search(rf"\b{re.escape(n)}\b", h, re.I):
                                 return i
                     return None
 
-                c_due  = idx("Date Due", "Due Date")
-                c_asgd = idx("Assigned", "Date Assigned")
-                c_asgn = idx("Assignment")
-                c_poss = idx("Pts Possible", "Possible")
-                c_sc   = idx("Score")
-                c_pct  = idx("Pct Score", "Pct")
-                c_comm = idx("Comments", "Comment")
+                c_due  = col("Date Due", "Due Date")
+                c_asgd = col("Assigned", "Date Assigned")
+                c_asgn = col("Assignment")
+                c_poss = col("Pts Possible", "Possible")
+                c_sc   = col("Score")
+                c_pct  = col("Pct Score", "Pct")
+                c_comm = col("Comments", "Comment")
 
                 for r in tbl[1:]:
                     cells = [_norm(x) for x in r]
@@ -120,13 +113,10 @@ def parse_progress_pdf(pdf_bytes, default_student="", course_hint="", period_hin
                     if "missing" in comm.lower() or sc == "0" or pct == "0":
                         flags.append("Missing")
                     try:
-                        if pct.endswith("%"):
-                            pct_val = float(pct.replace("%", ""))
-                        else:
-                            pct_val = float(pct)
-                        if pct_val < 70:
+                        val = float(pct.replace("%", "")) if pct.endswith("%") else float(pct)
+                        if val < 70:
                             flags.append("Low")
-                        if pct_val >= 95:
+                        if val >= 95:
                             flags.append("Win")
                     except:
                         pass
@@ -152,9 +142,6 @@ def parse_progress_pdf(pdf_bytes, default_student="", course_hint="", period_hin
 
 # --------------- main scrape ----------------
 def run_scrape(pin, password, students=("Adrian", "Jacob")):
-    """
-    Returns a list of row dicts ready for Google Sheets.
-    """
     all_rows = []
 
     with sync_playwright() as p:
@@ -164,17 +151,14 @@ def run_scrape(pin, password, students=("Adrian", "Jacob")):
 
         # Login
         page.goto("/", wait_until="domcontentloaded")
-        print("DEBUG — landed:", page.url)
-
-        _wait_visible(page, "#Pin", 15000)
-        _wait_visible(page, "#Password", 15000)
+        page.wait_for_selector("#Pin", timeout=15000)
+        page.wait_for_selector("#Password", timeout=15000)
         page.fill("#Pin", str(pin))
         page.fill("#Password", str(password))
         page.click("#LoginButton")
-        page.wait_for_load_state("domcontentloaded"); sleep(0.8)
-
-        # Ensure we're on the main portal page
-        page.goto("/Home/PortalMainPage", wait_until="domcontentloaded"); sleep(0.6)
+        # Land on portal (outer doc may host an iframe)
+        page.goto("/Home/PortalMainPage", wait_until="domcontentloaded")
+        time.sleep(0.6)
 
         for s in students:
             key = s.strip().lower()
@@ -183,84 +167,102 @@ def run_scrape(pin, password, students=("Adrian", "Jacob")):
                 print(f"DEBUG — no STUUNIQ mapping for {s}, skipping")
                 continue
 
-            # Switch the active student directly
+            # Switch active student at the top level
             page.goto(f"/StudentBanner/SetStudentBanner/{stuuniq}", wait_until="domcontentloaded")
-            page.goto("/Home/PortalMainPage", wait_until="domcontentloaded"); sleep(0.6)
+            page.goto("/Home/PortalMainPage", wait_until="domcontentloaded")
+            time.sleep(0.6)
 
-            # Assignments area exists on the page; find tables
-            if not _wait_visible(page, "#SP_Assignments", 8000):
-                print(f"DEBUG — Assignments container not visible for {s}")
+            fr = get_portal_frame(page)
+
+            # Verify which student is active via hidden banner field
+            hsid = ""
+            try:
+                fr.wait_for_selector("#hStudentID", timeout=8000)
+                hsid = fr.locator("#hStudentID").get_attribute("value") or ""
+            except:
+                pass
+            print(f"DEBUG — hStudentID for {s}: {hsid}")
+
+            # Make sure Assignments area is present; if not, click the left menu
+            have_assign = False
+            try:
+                fr.wait_for_selector("#SP_Assignments", timeout=8000)
+                have_assign = True
+            except:
+                # try opening the menu + clicking Assignments row
+                try:
+                    fr.locator("#menuTab").click()
+                    time.sleep(0.2)
+                    fr.locator("#Assignments").click()
+                    time.sleep(0.6)
+                    fr.wait_for_selector("#SP_Assignments", timeout=8000)
+                    have_assign = True
+                except:
+                    have_assign = False
+
+            if not have_assign:
+                print(f"DEBUG — Assignments container NOT visible for {s}")
                 continue
 
-            tbls = page.locator("#SP_Assignments table[id^='tblAssign_']")
-            count = tbls.count()
+            # Find class tables inside Assignments (must query INSIDE the frame)
+            tables = fr.locator("#SP_Assignments table[id^='tblAssign_']")
+            count = tables.count()
             print(f"DEBUG — class tables for {s}: {count}")
 
             for i in range(count):
-                tbl = tbls.nth(i)
-
-                # mstuniq is in the id "tblAssign_<mstuniq>"
+                tbl = tables.nth(i)
                 tid = tbl.get_attribute("id") or ""
                 m = re.search(r"tblAssign_(\d+)", tid)
                 if not m:
                     continue
                 mstuniq = m.group(1)
 
-                # Get period/course/teacher hints from the table content
+                # Hints: period/course/teacher
                 period = ""
                 course = ""
                 teacher = ""
-
-                # Caption text has "Per : X   Course (Code)"
-                cap = _first(tbl, "caption")
-                if cap:
-                    cap_text = cap.inner_text()
-                    cap_text = _norm(cap_text)
-                    # Try to split "Per : X   <course>"
-                    if "Per" in cap_text:
-                        try:
-                            after = cap_text.split("Per", 1)[1]
+                try:
+                    cap = tbl.locator("caption").first
+                    if cap.is_visible():
+                        ctext = _norm(cap.inner_text())
+                        if "Per" in ctext:
+                            after = ctext.split("Per", 1)[1]
                             after = after.split(":", 1)[1]
-                            parts = after.split(None, 1)  # ["X", "Course..."]
+                            parts = after.split(None, 1)
                             period = parts[0]
                             if len(parts) > 1:
                                 course = parts[1]
-                        except:
-                            pass
+                except:
+                    pass
+                try:
+                    a_teacher = tbl.locator("a[aria-label^='Teacher:']").first
+                    if a_teacher.is_visible():
+                        teacher = _norm(a_teacher.inner_text())
+                except:
+                    pass
 
-                # Teacher anchor has aria-label starting with "Teacher:"
-                a_teacher = _first(tbl, "a[aria-label^='Teacher:']")
-                if a_teacher:
-                    teacher = _norm(a_teacher.inner_text())
+                termc = "TP1"
+                try:
+                    hid = tbl.locator("input[id^='showmrktermc_']").first
+                    if hid.is_visible():
+                        termc = (hid.get_attribute("value") or "").strip() or "TP1"
+                except:
+                    pass
 
-                # The hidden input inside header carries the term code, e.g., TP1
-                termc = ""
-                hid = _first(tbl, "input[id^='showmrktermc_']")
-                if hid:
-                    termc = (hid.get_attribute("value") or "").strip()
-
-                if not termc:
-                    # Safe default, but log it
-                    print(f"DEBUG — term code missing for mstuniq={mstuniq}; defaulting TP1")
-                    termc = "TP1"
-
-                pdf_path = f"/Home/PrintProgressReport/{mstuniq}^{termc}"
-                pdf_url = urljoin(BASE, pdf_path)
-
+                pdf_url = urljoin(BASE, f"/Home/PrintProgressReport/{mstuniq}^{termc}")
                 resp = ctx.request.get(pdf_url)
                 if not resp.ok:
                     print(f"DEBUG — PDF GET failed {resp.status} for {pdf_url}")
                     continue
 
-                pdf_bytes = resp.body()
                 rows = parse_progress_pdf(
-                    pdf_bytes,
+                    resp.body(),
                     default_student=s,
                     course_hint=course,
                     period_hint=period,
                     teacher_hint=teacher,
                 )
-                print(f"DEBUG — parsed rows for {s}, class mstuniq={mstuniq}: {len(rows)}")
+                print(f"DEBUG — parsed rows for {s}, class {mstuniq}: {len(rows)}")
                 all_rows.extend(rows)
 
         browser.close()
