@@ -1,252 +1,241 @@
-# scraper.py
 from __future__ import annotations
+
 import re
-import time
-from typing import List
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
+from datetime import date
+from typing import List, Dict
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 
 BASE_URL = "https://parentportal.cajonvalley.net"
 
-
+# --------- utilities --------- #
 def dprint(*args):
     print("DEBUG —", *args, flush=True)
 
 
-def safe_text(el, default: str = "") -> str:
+def norm_students(students_csv_or_list) -> list[str]:
+    """Accepts 'Adrian,Jacob' or ['Adrian','Jacob'] or ('Adrian','Jacob')."""
+    if isinstance(students_csv_or_list, (list, tuple, set)):
+        return [str(s).strip() for s in students_csv_or_list if str(s).strip()]
+    return [s.strip() for s in str(students_csv_or_list or "").split(",") if s.strip()]
+
+
+def pct_to_float(text: str) -> float | None:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", text or "")
+    return float(m.group(1)) if m else None
+
+
+def cell_text_safe(locator) -> str:
     try:
-        return (el.inner_text() if el else default).strip()
+        return locator.inner_text().strip()
+    except PWTimeoutError:
+        return ""
     except Exception:
-        return default
+        return ""
 
 
-def safe_num(txt: str) -> str:
-    """Keep as string for Sheets, but normalize whitespace."""
-    return (txt or "").strip()
-
-
-def wait_for_dom(page: Page, sleep_after: float = 0.0):
-    page.wait_for_load_state("domcontentloaded")
-    if sleep_after:
-        time.sleep(sleep_after)
-
-
-def safe_goto_portal(page: Page):
+# --------- core page helpers --------- #
+def login(page, username: str, password: str) -> None:
     """
-    Go to PortalMainPage but swallow a navigation abort if the site is already navigating.
+    Land on /, fill #Pin and #Password, click #LoginButton and wait for portal shell.
     """
-    try:
-        page.goto(f"{BASE_URL}/Home/PortalMainPage", wait_until="domcontentloaded")
-    except Exception as e:
-        if "ERR_ABORTED" not in str(e):
-            raise
-    wait_for_dom(page, 0.4)
-
-
-def login(page: Page, pin: str, password: str):
+    dprint("landed:", f"{BASE_URL}/")
     page.goto(f"{BASE_URL}/", wait_until="domcontentloaded")
 
-    # Make sure the two login fields are visible
-    pin_ok = False
-    pwd_ok = False
-    try:
-        page.wait_for_selector("#Pin", timeout=15000)
-        pin_ok = True
-    except PWTimeout:
-        pass
-    try:
-        page.wait_for_selector("#Password", timeout=15000)
-        pwd_ok = True
-    except PWTimeout:
-        pass
-    dprint("login fields visible:", pin_ok, pwd_ok)
+    # The login form is on the root.
+    pin = page.locator("#Pin")
+    pwd = page.locator("#Password")
+    btn = page.locator("#LoginButton")
 
-    page.fill("#Pin", str(pin))
-    page.fill("#Password", str(password))
-    page.click("#LoginButton")
+    pin.wait_for(state="visible", timeout=20000)
+    pwd.wait_for(state="visible", timeout=20000)
+    dprint("login fields visible:", True, True)
 
-    # Let the site redirect on its own; avoid issuing our own goto immediately.
-    try:
-        page.wait_for_url(re.compile(r".*/Home/PortalMainPage.*"), timeout=20000)
-    except Exception:
-        # If we didn't land there, try once (swallow a possible abort).
-        safe_goto_portal(page)
+    pin.fill(username)
+    pwd.fill(password)
+    btn.click()
 
-    wait_for_dom(page, 0.5)
+    # After login we should be in the portal; wait for the main container.
+    page.wait_for_url(re.compile(r"/Home/PortalMainPage"), timeout=30000)
+    page.wait_for_selector("#SP-MainDiv", timeout=30000)
+    dprint("after login: portal loaded")
 
 
-def build_student_map(page: Page) -> dict:
+def build_student_map(page) -> Dict[str, str]:
     """
-    Open the student selector and build a map of Nickname -> stuuniq.
+    Parse the hidden tile list:
+      #divSelectStudent .studentTile[data-stuuniq]
+    Map both nickname and full name to stuuniq.
     """
-    stu_map = {}
-    try:
-        # The "family" icon cell opens the student selector
-        page.click("#openSelect")
-        page.wait_for_selector("#divSelectStudent .studentTile", timeout=8000)
+    page.wait_for_selector("#divStudentBanner", timeout=20000)
 
-        tiles = page.query_selector_all("#divSelectStudent .studentTile")
-        for t in tiles:
-            nick = safe_text(t.query_selector(".tileStudentNickname"))
-            uniq = t.get_attribute("data-stuuniq")
-            if nick and uniq:
-                stu_map[nick] = uniq
+    tiles = page.locator("#divSelectStudent .studentTile")
+    count = tiles.count()
 
-        # Close the selector (clicking the header image or anywhere works)
-        try:
-            page.click("#imgStudents")
-        except Exception:
-            try:
-                page.click("body", position={"x": 5, "y": 5})
-            except Exception:
-                pass
+    m: Dict[str, str] = {}
+    for i in range(count):
+        t = tiles.nth(i)
+        stuuniq = t.get_attribute("data-stuuniq") or ""
+        nick = cell_text_safe(t.locator(".tileStudentNickname"))
+        full_name = cell_text_safe(t.locator(".tileStudentName"))
+        if stuuniq:
+            if nick:
+                m[nick] = stuuniq
+            if full_name:
+                m[full_name] = stuuniq
+                # also map first token of full name if it helps (e.g., "Miguel")
+                first = full_name.split(",")[-1].strip() if "," in full_name else full_name.split()[0]
+                if first:
+                    m.setdefault(first, stuuniq)
 
-    except Exception as e:
-        dprint("could not open student selector:", e)
-
-    dprint("student map:", stu_map)
-    return stu_map
+    dprint("saw student tiles:", bool(m))
+    return m
 
 
-def set_student(page: Page, stuuniq: str):
+def set_student(page, stuuniq: str) -> None:
     """
-    Switch the current student by calling the banner endpoint, then ensure
-    we are back on the portal page.
+    Switch the active student by calling the same endpoint the site uses.
     """
     page.goto(f"{BASE_URL}/StudentBanner/SetStudentBanner/{stuuniq}", wait_until="domcontentloaded")
-    safe_goto_portal(page)
+    # Confirm the hidden value matches the student ID
+    page.wait_for_selector(f'#hStudentID[value="{stuuniq}"]', timeout=15000)
 
 
-def extract_assignment_rows_from_table(page: Page, table_css: str, student: str, course_name: str) -> List[List[str]]:
+def ensure_assignments_loaded(page) -> None:
     """
-    Given a tblassign table, parse all rows into lists for Sheets.
-    Columns returned:
-      [Student, Course, Due Date, Assigned Date, Assignment, Points Possible, Score, Percent, Missing?, Not Graded?, Comments]
+    The 'Assignments' section content is placed in #SP_Assignments when loaded.
+    Inputs bAssignments/bAssignmentsLoaded indicate availability.
     """
-    rows_out: List[List[str]] = []
-    # Skip the "No Assignments Available" table quickly
-    if page.query_selector(f"{table_css} tbody tr td:has-text('No Assignments Available')"):
-        return rows_out
+    page.wait_for_selector("#SP-MainDiv", timeout=15000)
 
-    trs = page.query_selector_all(f"{table_css} tbody tr")
-    for tr in trs:
-        # Skip group headers or weird rows that don't have enough cells
-        tds = tr.query_selector_all("td")
-        if len(tds) < 5:
-            continue
+    # If the left menu exists, make sure Assignments area is present.
+    # Usually it's already expanded on load.
+    page.wait_for_selector("#SP_Assignments", timeout=20000)
+    dprint("nav_root for Assignments exists:", True)
 
-        # Pull columns by position; guard each one.
-        due = safe_text(tds[1]) if len(tds) > 1 else ""
-        assigned = safe_text(tds[2]) if len(tds) > 2 else ""
-        assignment = safe_text(tds[3]) if len(tds) > 3 else ""
-        pts_possible = safe_num(safe_text(tds[4]) if len(tds) > 4 else "")
-        score = safe_num(safe_text(tds[5]) if len(tds) > 5 else "")
-        pct = safe_num(safe_text(tds[6]) if len(tds) > 6 else "")
-        # not strictly needed but included for completeness
-        not_graded = safe_text(tds[9]) if len(tds) > 9 else ""
-        comments = safe_text(tds[10]) if len(tds) > 10 else ""
-
-        # Determine "missing" from row class or empty score
-        tr_class = (tr.get_attribute("class") or "").lower()
-        missing = ("missingassignment" in tr_class) or (score == "" and pct == "")
-
-        # Ignore obviously blank rows (like spacing rows)
-        if assignment == "" and due == "" and assigned == "":
-            continue
-
-        rows_out.append([
-            student,
-            course_name,
-            due,
-            assigned,
-            assignment,
-            pts_possible,
-            score,
-            pct,
-            "Y" if missing else "",
-            not_graded,
-            comments,
-        ])
-
-    return rows_out
+    # The tables are placed inside #SP_Assignments
+    page.wait_for_timeout(250)  # tiny pause to let tables render
 
 
-def parse_assignments_for_student(page: Page, student: str) -> List[List[str]]:
+def parse_assignments_for_student(page, student_name: str) -> List[List[str]]:
     """
-    Ensure the Assignments area is present, then extract rows from all class tables.
+    Scrape per-class tables inside #SP_Assignments.
+    Returns list of rows suitable for appending to Sheets.
+    Columns: [date, student, course, due_date, assignment, score_pct, category]
     """
-    rows: List[List[str]] = []
+    ensure_assignments_loaded(page)
 
-    # Try to ensure Assignments panel is visible/loaded
-    try:
-        # If the left menu exists, click the Assignments area item to focus/scroll it.
-        if page.query_selector("tr#Assignments"):
-            page.click("tr#Assignments")
-    except Exception:
-        pass
+    root = page.locator("#SP_Assignments")
+    tables = root.locator('table[id^="tblAssign_"]')
+    tcount = tables.count()
 
-    try:
-        page.wait_for_selector("#SP_Assignments", timeout=10000)
-    except PWTimeout:
-        dprint("assign_root not found for", student)
-        return rows
+    # One sheet row per assignment line
+    out_rows: List[List[str]] = []
+    today = date.today().isoformat()
 
-    # All class tables for assignments live under #SP_Assignments with class .tblassign
-    tables = page.query_selector_all("#SP_Assignments table.tblassign")
-    dprint("class tables for", f"{student}:", len(tables))
+    for ti in range(tcount):
+        tbl = tables.nth(ti)
 
-    for tbl in tables:
-        # Build a CSS to reference this table again (via its id if present)
-        tbl_id = tbl.get_attribute("id")
-        tbl_css = f"#{tbl_id}" if tbl_id else "#SP_Assignments table.tblassign"
+        # Course name is in the caption or in the header label
+        course = cell_text_safe(tbl.locator("caption")).strip()
+        course = re.sub(r"^\s*Per\s*:\s*\S+\s*", "", course)  # drop "Per: X " prefix if present
 
-        # Course name is in the <caption> element of the table
-        course = ""
-        try:
-            cap = tbl.query_selector("caption")
-            course = safe_text(cap)
-            # Clean the "Per: X   " prefix if present
-            course = re.sub(r"^\s*Per\s*:\s*\S+\s*", "", course)
-        except Exception:
-            pass
+        # Iterate body rows
+        body_rows = tbl.locator("tbody > tr")
+        for ri in range(body_rows.count()):
+            r = body_rows.nth(ri)
 
-        rows.extend(extract_assignment_rows_from_table(page, tbl_css, student, course))
+            # Skip the "No Assignments Available" blanket row if present
+            if "No Assignments" in r.inner_text():
+                continue
 
-    return rows
+            cls = r.get_attribute("class") or ""
+            is_missing = "missingAssignment" in cls
+
+            tds = r.locator("td")
+
+            # Heuristics based on provided HTML structure
+            due = ""
+            assign = ""
+            pct_txt = ""
+
+            # try specific ids first
+            ddate_el = r.locator('td[id^="ddate"]')
+            desc_el = r.locator('td[id^="descript"]')
+
+            if ddate_el.count() > 0:
+                due = cell_text_safe(ddate_el)
+            elif tds.count() >= 2:
+                due = cell_text_safe(tds.nth(1))
+
+            if desc_el.count() > 0:
+                assign = cell_text_safe(desc_el)
+            elif tds.count() >= 4:
+                assign = cell_text_safe(tds.nth(3))
+
+            # pct score is typically in the 7th cell (0-based index 6)
+            if tds.count() >= 7:
+                pct_txt = cell_text_safe(tds.nth(6))
+
+            pct_val = pct_to_float(pct_txt)
+            category = "OK"
+            if is_missing:
+                category = "MISSING"
+            elif pct_val is None or pct_val == 0:
+                # If no percent and not explicitly marked missing, treat as LOW (unscored)
+                category = "LOW"
+            elif pct_val < 70:
+                category = "LOW"
+            elif pct_val >= 90:
+                category = "WIN"
+
+            out_rows.append([today, student_name, course, due, assign, (pct_txt or "").strip(), category])
+
+    return out_rows
 
 
-def run_scrape(username: str, password: str, students_csv: str) -> List[List[str]]:
+# --------- public entrypoint --------- #
+def run_scrape(username: str, password: str, students_csv_or_list) -> List[List[str]]:
     """
-    Entrypoint called by main.py. Returns rows suitable for gspread append_rows().
-    `students_csv` is a comma-separated string of student nicknames that appear in the tiles.
+    Entrypoint used by main.py.
+    - Logs in
+    - Resolves requested student names to their stuuniq ids
+    - For each, switches active student and scrapes Assignments
+    Returns a list of rows to append to Google Sheets.
     """
+    students = norm_students(students_csv_or_list)
+
     all_rows: List[List[str]] = []
-    students = [s.strip() for s in students_csv.split(",") if s.strip()]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
+        # ignore_https_errors helps in CI runners that occasionally lack full CA bundles
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
         page.set_default_timeout(20000)
 
-        # ---- Login and land on Portal ----
-        dprint("landed:", f"{BASE_URL}/")
-        login(page, username, password)
+        try:
+            login(page, username, password)
+        except PWTimeoutError as e:
+            dprint("login failed (timeout):", str(e))
+            browser.close()
+            return all_rows
 
-        # ---- Map student nickname -> stuuniq ----
         stu_map = build_student_map(page)
 
-        # ---- Iterate students ----
         for student in students:
             stuuniq = stu_map.get(student)
             if not stuuniq:
                 dprint("tile not found for", student)
                 continue
 
-            # Switch student and be sure we are on PortalMainPage again
-            set_student(page, stuuniq)
+            try:
+                set_student(page, stuuniq)
+            except PWTimeoutError:
+                dprint("failed to switch to student", student)
+                continue
 
-            # Extract assignments rows for this student
             student_rows = parse_assignments_for_student(page, student)
             dprint("scraped rows for", f"{student}:", len(student_rows))
             all_rows.extend(student_rows)
