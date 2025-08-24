@@ -1,5 +1,6 @@
 # scraper.py
-# Ultra-robust login + cross-frame scraping for Q ParentConnection (Cajon Valley)
+# Login with PIN/Password on https://parentportal.cajonvalley.net/,
+# click known student tiles by ID, open Assignments, and scrape class tables.
 
 from playwright.sync_api import sync_playwright
 from datetime import datetime
@@ -9,6 +10,8 @@ from time import sleep
 ASSIGNMENTS_HEADER_RE = re.compile(r'^Per:\s*(\S+)\s+(.*)$', re.I)
 NUM_CLEAN = re.compile(r'[^0-9.\-]')
 
+# --- helpers ---------------------------------------------------------------
+
 def _to_num(v):
     if v is None: return None
     s = str(v).strip()
@@ -16,109 +19,43 @@ def _to_num(v):
     try: return float(NUM_CLEAN.sub('', s))
     except: return None
 
-def _all_roots(page):
-    # main page first, then frames
-    return [page] + list(page.frames)
-
-def _first_visible(root, sel):
+def _wait(page, selector, timeout_ms=10000):
     try:
-        loc = root.locator(sel).first
-        if loc.is_visible(): return loc
-    except: pass
-    return None
+        page.locator(selector).first.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except:
+        return False
 
-def _press_enter_on(root, selector):
+def _click_if_visible(page, selector):
     try:
-        el = root.locator(selector).first
+        el = page.locator(selector).first
         if el.is_visible():
-            el.press("Enter")
-            return True
-    except:
-        pass
+            el.click(); return True
+    except: pass
     return False
-
-def _log_frames(page, label):
-    try:
-        print(f"DEBUG — {label}: {len(page.frames)} frames")
-        for i, fr in enumerate(page.frames):
-            try:
-                print(f"DEBUG — frame[{i}] url={fr.url} name={fr.name}")
-            except:
-                pass
-    except:
-        pass
-
-def _find_root_with_selector(page, sel, min_visible=1, timeout_ms=6000):
-    elapsed = 0
-    step = 250
-    while elapsed < timeout_ms:
-        for r in _all_roots(page):
-            try:
-                locs = r.locator(sel)
-                count = locs.count()
-                vis = 0
-                for i in range(min(25, count)):
-                    if locs.nth(i).is_visible(): vis += 1
-                if vis >= min_visible:
-                    return r
-            except:
-                pass
-        sleep(step/1000); elapsed += step
-    return None
-
-def _click_student_tile_anywhere(page, nickname, id_hint=None):
-    for root in _all_roots(page):
-        # 1) Try ID first (most reliable)
-        if id_hint:
-            loc = _first_visible(root, f"#stuTile_{id_hint}")
-            if loc:
-                loc.click(); return True
-        # 2) Try nickname inside tile
-        loc = _first_visible(root, f"css=div.studentTile:has(span.tileStudentNickname:has-text('{nickname}'))")
-        if loc:
-            loc.click(); return True
-        # 3) Any tile that contains nickname text
-        loc = _first_visible(root, f"css=div.studentTile:has-text('{nickname}')")
-        if loc:
-            loc.click(); return True
-    return False
-
-def _go_assignments_anywhere(page):
-    # Try in any root (page or frames)
-    for root in _all_roots(page):
-        loc = _first_visible(root, "td.td2_action:has-text('Assignments')")
-        if loc:
-            loc.click(); return root
-    # Fallback: any visible text "Assignments"
-    for root in _all_roots(page):
-        try:
-            el = root.get_by_text(re.compile(r"\bAssignments\b", re.I)).first
-            if el.is_visible():
-                el.click(); return root
-        except: pass
-    return None
 
 def _extract_sections(root):
+    """find div blocks that contain 'Per:' and a table"""
     sections = []
     blocks = root.locator("xpath=//div[.//text()[contains(.,'Per:')]]").all()
     for b in blocks:
         try:
             if b.locator("css=table").first.count() > 0:
                 sections.append(b)
-        except: 
-            continue
+        except: pass
     return sections
 
 def _scrape_table(table, student_name, period, course, teacher):
-    out = []
     rows = table.locator("tr").all()
-    if len(rows) < 2: return out
+    if len(rows) < 2: return []
 
     headers = [c.inner_text().strip() for c in rows[0].locator("th,td").all()]
+
     def col(*names):
         for n in names:
             if n in headers: return headers.index(n)
         return None
+
     c_due   = col("Date Due","Due Date")
     c_asgn  = col("Assignment")
     c_asgnd = col("Assigned","Date Assigned")
@@ -127,6 +64,7 @@ def _scrape_table(table, student_name, period, course, teacher):
     c_pct   = col("Pct Score","Pct")
     c_comm  = col("Comments","Comment")
 
+    out = []
     imported_at = datetime.utcnow().isoformat()
     for r in rows[1:]:
         tds = [c.inner_text().strip() for c in r.locator("td").all()]
@@ -147,7 +85,8 @@ def _scrape_table(table, student_name, period, course, teacher):
         if pct is not None and pct >= 95: flags.append("Win")
 
         out.append({
-            "ImportedAt": imported_at, "Student": student_name,
+            "ImportedAt": imported_at,
+            "Student": student_name,
             "Period": period, "Course": course, "Teacher": teacher,
             "DueDate": due, "AssignedDate": asgnd, "Assignment": assignment,
             "PtsPossible": poss if poss is not None else "",
@@ -158,14 +97,19 @@ def _scrape_table(table, student_name, period, course, teacher):
         })
     return out
 
-def _scrape_from_assignments_root(root, student_name):
-    results = []
-    sections = _extract_sections(root)
+def _scrape_from_assignments(page, student_name):
+    # Click the left-nav "Assignments" cell if present
+    _click_if_visible(page, "td.td2_action:has-text('Assignments')")
+    sleep(0.5)
+
+    sections = _extract_sections(page)
     print(f"DEBUG — sections for {student_name}: {len(sections)}")
+
+    # Fallback: any visible table that has an "Assignment" header
     if not sections:
-        # fallback: any table with 'Assignment' header
-        tables = root.locator("xpath=//table[.//th[contains(.,'Assignment')]]").all()
+        tables = page.locator("xpath=//table[.//th[contains(.,'Assignment')]]").all()
         print(f"DEBUG — fallback tables for {student_name}: {len(tables)}")
+        results = []
         for t in tables:
             try:
                 container = t.locator("xpath=ancestor::div[.//text()[contains(.,'Per:')]][1]").first
@@ -186,6 +130,7 @@ def _scrape_from_assignments_root(root, student_name):
             results.extend(_scrape_table(t, student_name, period, course, teacher))
         return results
 
+    results = []
     for sec in sections:
         try: header = sec.text_content() or ""
         except: continue
@@ -206,103 +151,76 @@ def _scrape_from_assignments_root(root, student_name):
 
         table = sec.locator("css=table").first
         if not table or not table.is_visible(): continue
-
         results.extend(_scrape_table(table, student_name, period, course, teacher))
     return results
 
-def run_scrape(username, password, students=("Adrian","Jacob")):
+# --- main scrape -----------------------------------------------------------
+
+def run_scrape(pin, password, students=("Adrian","Jacob")):
+    """
+    pin  = your ParentPortal PIN (we use PORTAL_USER env for this)
+    password = your ParentPortal password
+    """
+    # Map student names to known tile IDs you provided.
+    TILE_ID = {
+        "adrian": "357342",
+        "jacob":  "357354",
+    }
+
     all_rows = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
+        ctx = browser.new_context()
+        page = ctx.new_page()
 
-        page.goto("https://parentportal.cajonvalley.net/Home/PortalMainPage", wait_until="domcontentloaded")
+        # 1) Go to the **login page** (root URL you shared)
+        page.goto("https://parentportal.cajonvalley.net/", wait_until="domcontentloaded")
         print("DEBUG — landed:", page.url)
-        sleep(0.8)
-        _log_frames(page, "after landing")
 
-        # Some sites show a pre-login link
-        for root in _all_roots(page):
-            try:
-                root.get_by_text(re.compile(r"\b(Sign In|Log In|Login)\b", re.I)).first.click()
-                break
+        # 2) Fill PIN & Password using exact IDs you shared
+        pin_ok = _wait(page, "#Pin", 10000)
+        pwd_ok = _wait(page, "#Password", 10000)
+        print("DEBUG — login fields visible:", pin_ok, pwd_ok)
+        if pin_ok: page.fill("#Pin", str(pin))
+        if pwd_ok: page.fill("#Password", str(password))
+
+        # 3) Click the Login button (type=button, id=LoginButton)
+        clicked = _click_if_visible(page, "#LoginButton")
+        if not clicked:
+            # as a fallback, press Enter in the password field
+            try: page.locator("#Password").press("Enter")
             except: pass
 
-        # Fill the first visible text + password inputs anywhere (page or frames)
-        text_filled = False
-        pass_filled = False
-        for root in _all_roots(page):
-            try:
-                el = root.locator('input[type="text"]').first
-                if el.is_visible():
-                    el.fill(username); text_filled = True; break
-            except: pass
-        for root in _all_roots(page):
-            try:
-                el = root.locator('input[type="password"]').first
-                if el.is_visible():
-                    el.fill(password); pass_filled = True; pwd_root = root; break
-            except: pass
-        print("DEBUG — filled text:", text_filled, "filled password:", pass_filled)
+        # 4) Wait for the student picker (your tiles by ID)
+        tiles = [f"#stuTile_{TILE_ID['adrian']}", f"#stuTile_{TILE_ID['jacob']}"]
+        saw_tiles = any(_wait(page, sel, 12000) for sel in tiles)
+        print("DEBUG — saw student tiles:", saw_tiles)
 
-        # Submit: press Enter on password field; also try clicking any obvious submit
-        if pass_filled:
-            _press_enter_on(pwd_root, 'input[type="password"]')
-        clicked_submit = False
-        for root in _all_roots(page):
-            for sel in ["text=Sign In","text=Log In","text=Login",'css=input[type="submit"]','css=button[type="submit"]','#btnLogin']:
-                try:
-                    el = root.locator(sel).first
-                    if el.is_visible():
-                        el.click(); clicked_submit = True; break
-                except: pass
-            if clicked_submit: break
-
-        page.wait_for_load_state("domcontentloaded"); sleep(1.2)
-        _log_frames(page, "after login")
-
-        # Try to find the tiles anywhere; if not, navigate Home explicitly
-        tiles_root = _find_root_with_selector(page, "css=div.studentTile", 1, 6000)
-        if not tiles_root:
-            for root in _all_roots(page):
-                try:
-                    root.get_by_text(re.compile(r"\bHome\b", re.I)).first.click()
-                    break
-                except: pass
-            page.wait_for_load_state("domcontentloaded"); sleep(0.8)
-            _log_frames(page, "after Home")
-            tiles_root = _find_root_with_selector(page, "css=div.studentTile", 1, 6000)
-
-        print("DEBUG — tiles_root exists:", bool(tiles_root))
+        # If we didn’t navigate, try the main page directly
+        if not saw_tiles:
+            page.goto("https://parentportal.cajonvalley.net/Home/PortalMainPage", wait_until="domcontentloaded")
+            saw_tiles = any(_wait(page, sel, 8000) for sel in tiles)
+            print("DEBUG — after direct goto, saw tiles:", saw_tiles)
 
         for s in students:
-            # map known IDs (from your HTML)
-            id_hint = "357342" if s.lower().startswith("adrian") else ("357354" if s.lower().startswith("jacob") else None)
-            clicked = _click_student_tile_anywhere(page, s, id_hint=id_hint)
-            print(f"DEBUG — clicked tile for {s}: {clicked}")
-            page.wait_for_load_state("domcontentloaded"); sleep(1.0)
+            sid = TILE_ID.get(s.lower())
+            if not sid:
+                print(f"DEBUG — no tile id mapping for {s}, skipping")
+                continue
 
-            # Click Assignments in whichever root has it
-            assign_root = _find_root_with_selector(page, "td.td2_action:has-text('Assignments')", 1, 5000)
-            print("DEBUG — assign_root exists:", bool(assign_root))
-            rows = []
-            if assign_root:
-                assign_clicked_in = _go_assignments_anywhere(page)
-                page.wait_for_load_state("domcontentloaded"); sleep(0.8)
-                # scrape from the root that actually contains assignments (in case nav switched frames)
-                assign_root = _find_root_with_selector(page, "xpath=//table[.//th[contains(.,'Assignment')]]", 1, 5000) or assign_root
-                rows = _scrape_from_assignments_root(assign_root, s)
+            # 5) Click the student tile by **ID**
+            clicked_tile = _click_if_visible(page, f"#stuTile_{sid}")
+            print(f"DEBUG — clicked tile for {s}: {clicked_tile}")
+            sleep(0.8)
+
+            # 6) Scrape Assignments on that page
+            rows = _scrape_from_assignments(page, s)
             print(f"DEBUG — scraped rows for {s}: {len(rows)}")
             all_rows.extend(rows)
 
-            # Back to picker
-            for root in _all_roots(page):
-                try:
-                    root.get_by_text(re.compile(r"\bHome\b", re.I)).first.click()
-                    break
-                except: pass
-            page.wait_for_load_state("domcontentloaded"); sleep(0.6)
+            # 7) Back to Home (to switch to the other student)
+            _click_if_visible(page, "text=Home")
+            sleep(0.7)
 
         browser.close()
     return all_rows
