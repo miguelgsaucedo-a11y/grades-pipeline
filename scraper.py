@@ -1,404 +1,271 @@
-# scraper.py
-from __future__ import annotations
-
 import re
-from dataclasses import dataclass
-from datetime import datetime
+import time
 from typing import Dict, List, Tuple
 
-from playwright.sync_api import sync_playwright, Page, Locator
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
-BASE = "https://parentportal.cajonvalley.net"
-LOGIN_URL = BASE
-PORTAL_HOME = f"{BASE}/Home/PortalMainPage"
+LOGIN_URL = "https://parentportal.cajonvalley.net/"
+PORTAL_HOME = "https://parentportal.cajonvalley.net/Home/PortalMainPage"
 
-ASSIGNMENT_TEXT_MARKERS = [
-    "No Assignments Available",
-    "No Current Assignments",
-    "No Assignments",
-]
-
-HEADERS = [
-    "ImportedAt","Student","Period","Course","Teacher","DueDate","AssignedDate",
-    "Assignment","PtsPossible","Score","Pct","Status","Comments","SourceURL",
-]
-
-def now_stamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def _body_text(page: Page) -> str:
+# ---------- Utility: resilient navigation ----------
+def safe_goto(page, url: str, wait: str = "domcontentloaded", timeout: int = 15000):
     try:
-        return page.locator("body").inner_text(timeout=2000)
-    except Exception:
-        return ""
+        page.goto(url, wait_until=wait, timeout=timeout)
+    except PlaywrightError:
+        # Fall back to 'commit' to handle portals that interrupt domcontentloaded with redirects
+        print(f"DEBUG — goto({url}) {wait} aborted: retrying with 'commit'")
+        page.goto(url, wait_until="commit", timeout=timeout)
 
-def _dismiss_timeout_if_present(page: Page) -> None:
-    try:
-        dlg = page.get_by_role("dialog").first
-        if dlg.is_visible(timeout=800):
-            ok = dlg.get_by_role("button", name=re.compile(r"ok", re.I)).first
-            if ok.is_visible(timeout=400):
-                print("DEBUG — login DEBUG — dismissed timeout dialog")
-                ok.click()
-                page.wait_for_timeout(250)
-    except Exception:
-        pass
+# ---------- Login flow ----------
+def ensure_logged_in(page, username: str, password: str) -> None:
+    safe_goto(page, LOGIN_URL, "domcontentloaded")
+    print(f"DEBUG — landed: {page.url}")
 
-def _goto(page: Page, url: str, timeout: int = 20000, label: str | None = None) -> None:
-    tag = label or url
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    # If already on PortalMainPage (session/cookies), bail early
+    if page.url.startswith(PORTAL_HOME):
         return
-    except Exception as e1:
-        print(f"DEBUG — goto({tag}) domcontentloaded aborted: {e1}. Retrying with 'commit'.")
-        try:
-            page.goto(url, wait_until="commit", timeout=timeout)
-            page.wait_for_load_state("domcontentloaded", timeout=timeout)
-        except Exception as e2:
-            print(f"DEBUG — goto({tag}) commit fallback also raised: {e2}. Continuing at {page.url}.")
 
-def _first_visible(page: Page, selectors: List[str], timeout: int = 1200) -> Locator | None:
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=timeout):
-                return loc
-        except Exception:
-            pass
-    return None
+    # Handle “session timed out” dialogs, if any
+    timeout_dialog = page.locator("text=timed out, Click OK to Continue").first
+    if timeout_dialog.is_visible():
+        timeout_dialog.click()
 
-def _by_label(page: Page, labels: List[str], timeout: int = 1200) -> Locator | None:
-    for label in labels:
-        try:
-            loc = page.get_by_label(re.compile(label, re.I)).first
-            if loc.is_visible(timeout=timeout):
-                return loc
-        except Exception:
-            pass
-    return None
+    # Detect login fields in a tolerant way
+    pin = page.locator('input[name="PIN"], input#PIN, input[id*="PIN" i], input[placeholder*="PIN" i]').first
+    pwd = page.locator(
+        'input[type="password"], input[name="Password"], input#Password, input[id*="Password" i]'
+    ).first
+    login_btn = page.locator(
+        'button:has-text("Login"), input[type="submit"][value*="Login" i], a:has-text("Login")'
+    ).first
 
-def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: str) -> None:
-    _goto(page, LOGIN_URL, label="LOGIN_URL")
-    _dismiss_timeout_if_present(page)
+    fields_visible = pin.is_visible() and pwd.is_visible()
+    print(f"DEBUG — login fields visible: {fields_visible}")
 
-    pin = _by_label(page, [r"\bPIN\b"]) or _first_visible(
-        page, ['input[name*="pin" i]','input[id*="pin" i]','input[type="text"]']
+    if fields_visible:
+        pin.fill(username)
+        pwd.fill(password)
+        if login_btn.is_visible():
+            login_btn.click()
+        else:
+            pwd.press("Enter")
+
+    # Land on main page
+    safe_goto(page, PORTAL_HOME, "domcontentloaded")
+
+# ---------- Student switching ----------
+def switch_to_student_by_header_text(page, student: str) -> None:
+    """
+    The portal shows the active student's name in the header/nav; clicking
+    the other student's name switches context.
+    We wait for any text change in the header region.
+    """
+    # Try a broad search to find the clickable student name
+    candidate = page.get_by_text(student, exact=True).first
+    if candidate.is_visible():
+        candidate.click()
+        time.sleep(0.4)  # small settle
+        print(f"DEBUG — switched via header text to student '{student}'")
+    else:
+        print(f"DEBUG — could not locate a picker for '{student}'; skipping switch")
+
+# ---------- Table pairing helpers ----------
+def _collect_tables_positioned(page) -> Tuple[List[dict], List[dict]]:
+    """
+    Returns (assignment_tables, meta_tables) with ids and top positions.
+    Assignment tables have id like 'tblAssign_12345'.
+    Meta tables are any tables whose text hints at 'Period', 'Course', or 'Teacher'.
+    """
+    # All tables
+    ids = page.eval_on_selector_all(
+        "table", "els => els.map(e => ({ id: e.id || '', text: e.innerText || '', top: e.getBoundingClientRect().top }))"
     )
-    pwd = _by_label(page, [r"password"]) or _first_visible(
-        page, ['input[type="password"]','input[name*="pass" i]','input[id*="pass" i]']
-    )
 
-    login_btn = None
-    for name in [r"log\s*in", r"log\s*on", r"sign\s*in"]:
-        try:
-            cand = page.get_by_role("button", name=re.compile(name, re.I)).first
-            if cand.is_visible(timeout=900):
-                login_btn = cand
+    assign = []
+    meta = []
+    for item in ids:
+        tid = (item.get("id") or "").strip()
+        text = (item.get("text") or "").strip()
+        top = float(item.get("top") or 0.0)
+        if tid.startswith("tblAssign_"):
+            assign.append({"id": tid, "top": top})
+        else:
+            # simple heuristic for the info table above each assignment list
+            if re.search(r"\b(Period|Course|Teacher)\b", text, flags=re.I):
+                meta.append({"id": tid, "top": top, "text": text})
+    return assign, meta
+
+def _pair_meta_for_assign(assign_tables: List[dict], meta_tables: List[dict]) -> Dict[str, dict]:
+    """
+    For each assignments table, pick the nearest meta table *above* it.
+    """
+    meta_sorted = sorted(meta_tables, key=lambda m: m["top"])
+    mapping = {}
+    for a in assign_tables:
+        tops_below = [m for m in meta_sorted if m["top"] < a["top"]]
+        if tops_below:
+            mapping[a["id"]] = tops_below[-1]  # closest above
+        else:
+            mapping[a["id"]] = {"id": "", "top": -1, "text": ""}
+    return mapping
+
+def _parse_meta_text(text: str) -> dict:
+    """
+    Parse a small "detail table" or header text into fields.
+    Looks for 'Period:', 'Course:', 'Teacher:' (order/format tolerant).
+    """
+    meta = {"Period": "", "Course": "", "Teacher": ""}
+
+    # Try straight 'Key: Value' patterns
+    for key in ("Period", "Course", "Teacher"):
+        m = re.search(rf"{key}\s*[:\-–]\s*([^\n\r|]+)", text, flags=re.I)
+        if m:
+            meta[key] = m.group(1).strip()
+
+    # If Course still empty, sometimes the first non-empty line is the course
+    if not meta["Course"]:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in lines:
+            if not re.search(r"(Period|Teacher|Terms of Use)", ln, flags=re.I):
+                meta["Course"] = ln
                 break
-        except Exception:
-            pass
 
-    visible = bool(pin and pwd and login_btn)
-    print(f"DEBUG — login fields visible: {visible}")
-    if not visible:
-        print("ERROR: Login form not found — cannot proceed.")
-        return
+    # Period might be embedded like "Period 2" without colon
+    if not meta["Period"]:
+        m = re.search(r"Period\s*([A-Za-z0-9\-]+)", text, flags=re.I)
+        if m:
+            meta["Period"] = m.group(1).strip()
 
-    pin.fill(pin_value)
-    pwd.fill(password_value)
-    login_btn.click()
-    page.wait_for_load_state("domcontentloaded", timeout=20000)
-    _dismiss_timeout_if_present(page)
+    return meta
 
-    _goto(page, PORTAL_HOME, label="PORTAL_HOME")
-    _dismiss_timeout_if_present(page)
-    print("DEBUG — after login: portal loaded")
+# ---------- Assignment extraction ----------
+def _extract_rows_from_assign_table(page, table_id: str) -> List[dict]:
+    """
+    From a single assignments table (by id), read header cells to build a column map,
+    then collect each row. Returns list of dicts with the *assignment-only* fields.
+    """
+    return page.evaluate(
+        """
+(id) => {
+  const t = document.getElementById(id);
+  if (!t) return [];
+  // Header detection: use the first row containing THs or, if missing, first TR.
+  let headerCells = [];
+  const headThs = t.querySelectorAll("thead th");
+  if (headThs && headThs.length) {
+    headerCells = Array.from(headThs).map(x => (x.textContent || "").trim());
+  } else {
+    const first = t.querySelector("tr");
+    if (first) headerCells = Array.from(first.children).map(x => (x.textContent || "").trim());
+  }
+  const norm = s => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const idx = {};
+  headerCells.forEach((h, i) => idx[norm(h)] = i);
 
-def expand_header_if_collapsed(page: Page) -> None:
-    try:
-        toggler = page.locator(
-            'button.navbar-toggler, button[aria-label*="Toggle"], button[aria-expanded="false"]'
-        ).first
-        if toggler.is_visible(timeout=700):
-            toggler.click()
-            page.wait_for_timeout(200)
-    except Exception:
-        pass
+  const getVal = (tds, ...keys) => {
+    for (const k of keys) {
+      const i = idx[norm(k)];
+      if (i !== undefined && tds[i] !== undefined) return (tds[i].innerText || "").trim();
+    }
+    return "";
+  };
 
-def _click_nav_by_name(page: Page, names: List[str]) -> bool:
-    for nm in names:
-        for role in ("link","button","tab"):
-            try:
-                el = page.get_by_role(role, name=re.compile(nm, re.I)).first
-                if el.is_visible(timeout=600):
-                    el.click()
-                    page.wait_for_timeout(350)
-                    return True
-            except Exception:
-                pass
-    return False
+  const bodyRows = Array.from(t.querySelectorAll("tbody tr")).filter(r => r.querySelectorAll("td").length);
+  return bodyRows.map(tr => {
+    const tds = Array.from(tr.children);
+    return {
+      DueDate: getVal(tds, "Due Date", "Due"),
+      AssignedDate: getVal(tds, "Assigned Date", "Assigned"),
+      Assignment: getVal(tds, "Assignment", "Assignment Title", "Title"),
+      PtsPossible: getVal(tds, "Points Possible", "Pts Possible", "Points"),
+      Score: getVal(tds, "Score"),
+      Pct: getVal(tds, "Pct", "Percent", "Percentage"),
+      Status: getVal(tds, "Status"),
+      Comments: getVal(tds, "Comments", "Comment"),
+      _hasAny: true
+    };
+  });
+}
+""",
+        table_id,
+    )
 
-def _nudge_assignments_ui(page: Page) -> None:
-    expand_header_if_collapsed(page)
-    # Try to land on Home then Assignments/Classes, if such controls exist.
-    _click_nav_by_name(page, [r"^\s*home\s*$"])
-    _click_nav_by_name(page, [r"assignments?", r"classes?"])
-    # Scroll to trigger lazy loads
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    page.wait_for_timeout(400)
-    page.evaluate("window.scrollTo(0, 0)")
+# ---------- Orchestration for one student ----------
+def extract_assignments_for_student(page, student: str) -> List[dict]:
+    switch_to_student_by_header_text(page, student)
 
-    # Try to expand any collapsed panels that might contain assignments
-    try:
-        for tog in page.locator('[aria-expanded="false"], [data-toggle="collapse"]').all():
-            try:
-                if tog.is_visible():
-                    tog.click()
-                    page.wait_for_timeout(200)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Give the page a moment to update after switching
+    time.sleep(0.5)
 
-    # If Assignments anchor exists, scroll it into view
-    try:
-        page.evaluate("""
-            const el = document.querySelector('#SP_Assignments');
-            if (el) el.scrollIntoView({behavior:'instant', block:'center'});
-        """)
-        page.wait_for_timeout(200)
-    except Exception:
-        pass
+    # Collect positions of all tables; identify assignment tables + their nearest meta
+    assign_tables, meta_tables = _collect_tables_positioned(page)
 
-def _count_assignment_tables(page: Page, visible_only: bool) -> int:
-    # Count tables whether or not they’re visible; visibility is optional.
-    sels = ['table[id^="tblAssign_"]', '#SP_Assignments table.tblassign', 'table.tblassign']
-    total = 0
-    for sel in sels:
-        try:
-            loc = page.locator(sel)
-            if visible_only:
-                # Count only those that are visible
-                total += sum(1 for _ in loc.filter(":visible").all())
-            else:
-                total += loc.count()
-        except Exception:
-            pass
-    # Also accept known empty-state texts as a “ready” signal
-    if total == 0:
-        for txt in ASSIGNMENT_TEXT_MARKERS:
-            try:
-                if page.locator(f"text={txt}").first.count() > 0:
-                    return 0  # ready but no rows
-            except Exception:
-                pass
-    return total
+    # Basic visibility snapshot (debug)
+    print(f"DEBUG — check 1: tables present={len(assign_tables)}, visible=0")
+    print(f"DEBUG — check 2: tables present={len(meta_tables)}, visible=0")
 
-def ensure_assignments_ready(page: Page) -> bool:
-    if "PortalMainPage" not in page.url:
-        _goto(page, PORTAL_HOME, label="ensure_assignments_ready->home")
+    # Pair
+    pair_map = _pair_meta_for_assign(assign_tables, meta_tables)
 
-    # Try up to ~25s with nudges between checks.
-    for attempt in range(1, 6):
-        c_any = _count_assignment_tables(page, visible_only=False)
-        c_vis = _count_assignment_tables(page, visible_only=True)
-        print(f"DEBUG — check {attempt}: tables present={c_any}, visible={c_vis}")
-        if c_any > 0 or c_vis > 0:
-            return True
-        _nudge_assignments_ui(page)
-    return False
+    all_rows: List[dict] = []
+    for a in assign_tables:
+        table_id = a["id"]
+        rows = _extract_rows_from_assign_table(page, table_id)
 
-def switch_to_student(page: Page, student_name: str) -> bool:
-    expand_header_if_collapsed(page)
-    # Dropdown/picker attempts
-    for sel in ["#divStudentBanner","#ddlStudent","#studentPicker",'[id*="Student"][role="button"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible(timeout=800):
-                el.click()
-                for role in ("menuitem","option"):
-                    try:
-                        page.get_by_role(role, name=re.compile(student_name, re.I)).first.click(timeout=2500)
-                        print(f"DEBUG — switched via {role} to student '{student_name}'")
-                        _goto(page, PORTAL_HOME, label="PORTAL_HOME(after switch)")
-                        return True
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    # Header text fallback
-    try:
-        link = page.get_by_text(re.compile(rf"\b{re.escape(student_name)}\b", re.I)).first
-        if link.is_visible(timeout=900):
-            link.click()
-            print(f"DEBUG — switched via header text to student '{student_name}'")
-            _goto(page, PORTAL_HOME, label="PORTAL_HOME(after switch)")
-            return True
-    except Exception:
-        pass
-
-    print(f"DEBUG — could not locate a picker for '{student_name}'; skipping switch")
-    return False
-
-# ---------------- Parsing ----------------
-@dataclass
-class ClassContext:
-    period: str
-    course: str
-    teacher: str
-
-def _extract_class_context_for_table(page: Page, table: Locator) -> ClassContext:
-    header_text = ""
-    try:
-        header = table.locator(
-            'xpath=ancestor::div[contains(@class,"panel") or contains(@class,"card")][1]'
-            '//h3 | ancestor::div[contains(@class,"panel") or contains(@class,"card")][1]'
-            '//h4 | ancestor::div[contains(@class,"panel") or contains(@class,"card")][1]'
-            '//*[contains(@class,"title") or contains(@class,"header")][1]'
-        ).first
-        if header.is_visible():
-            header_text = header.inner_text().strip()
-    except Exception:
-        pass
-    if not header_text:
-        try:
-            header = table.locator("xpath=preceding::h3[1] | preceding::h4[1]").first
-            if header.is_visible():
-                header_text = header.inner_text().strip()
-        except Exception:
-            pass
-
-    period = ""
-    course = header_text.strip()
-    teacher = ""
-
-    m = re.search(r"Period\s*([0-9A-Za-z]+)", header_text, re.I)
-    if m:
-        period = m.group(1)
-    else:
-        m2 = re.match(r"^\s*([0-9A-Za-z]{1,3})\s+", header_text)
-        if m2:
-            period = m2.group(1)
-
-    m = re.search(r"Teacher[:\s]*([A-Za-z .,'-]+)", header_text, re.I)
-    if m:
-        teacher = m.group(1).strip()
-    else:
-        m2 = re.search(r"\(([A-Za-z .,'-]{2,})\)\s*$", header_text)
-        if m2:
-            teacher = m2.group(1).strip()
-
-    return ClassContext(period=period, course=course, teacher=teacher)
-
-def _parse_table_rows(page: Page, table: Locator, student: str) -> List[List[str]]:
-    ctx = _extract_class_context_for_table(page, table)
-
-    headers = []
-    try:
-        headers = [h.strip() for h in table.locator("thead tr th").all_inner_texts()]
-    except Exception:
-        pass
-    if not headers:
-        try:
-            headers = [h.strip() for h in table.locator("tr").first.locator("th,td").all_inner_texts()]
-        except Exception:
-            headers = []
-
-    def idx(name: str) -> int | None:
-        for i, h in enumerate(headers):
-            if re.search(rf"\b{name}\b", h, re.I):
-                return i
-        return None
-
-    i_assgn = idx("Assignment") or idx("Title")
-    i_due = idx("Due") or idx("Due Date")
-    i_assigned = idx("Assigned")
-    i_pts = idx("Pts") or idx("Points")
-    i_score = idx("Score")
-    i_pct = idx("Pct") or idx("%")
-    i_status = idx("Status")
-    i_comments = idx("Comments") or idx("Notes")
-
-    out: List[List[str]] = []
-    for tr in table.locator("tbody tr").all():
-        tds = [c.strip() for c in tr.locator("td").all_inner_texts()]
-        if not tds:
-            continue
-        if any("No Assignments" in x for x in tds):
+        if not rows:
             continue
 
-        def pick(i: int | None) -> str:
-            return tds[i] if (i is not None and i < len(tds)) else ""
+        meta_txt = pair_map.get(table_id, {}).get("text", "")
+        meta = _parse_meta_text(meta_txt)
 
-        out.append([
-            now_stamp(),          # ImportedAt
-            student,              # Student
-            ctx.period,           # Period
-            ctx.course,           # Course
-            ctx.teacher,          # Teacher
-            pick(i_due),          # DueDate
-            pick(i_assigned),     # AssignedDate
-            pick(i_assgn),        # Assignment
-            pick(i_pts),          # PtsPossible
-            pick(i_score),        # Score
-            pick(i_pct),          # Pct
-            pick(i_status),       # Status
-            pick(i_comments),     # Comments
-            page.url,             # SourceURL
-        ])
-    return out
+        for r in rows:
+            if not r.get("_hasAny"):
+                continue
+            # Normalize dates as-is (let Sheets treat them as strings; users can format)
+            row = {
+                "Student": student,
+                "Period": meta.get("Period", ""),
+                "Course": meta.get("Course", ""),
+                "Teacher": meta.get("Teacher", ""),
+                "DueDate": r.get("DueDate", ""),
+                "AssignedDate": r.get("AssignedDate", ""),
+                "Assignment": r.get("Assignment", ""),
+                "PtsPossible": r.get("PtsPossible", ""),
+                "Score": r.get("Score", ""),
+                "Pct": r.get("Pct", ""),
+                "Status": r.get("Status", ""),
+                "Comments": r.get("Comments", ""),
+                "SourceURL": f"{PORTAL_HOME}#{table_id}",
+            }
+            all_rows.append(row)
 
-def extract_assignments_for_student(page: Page, student: str) -> Tuple[List[List[str]], int]:
-    if not switch_to_student(page, student):
-        return [], 0
+    print(f"DEBUG — class tables for {student}: {len(assign_tables)}")
+    return all_rows
 
-    # Multi-phase readiness attempts
-    if not ensure_assignments_ready(page):
-        print("DEBUG — assignments view not ready; continuing")
-        return [], 0
-
-    # Count before parsing (present vs visible)
-    present = _count_assignment_tables(page, visible_only=False)
-    visible = _count_assignment_tables(page, visible_only=True)
-    print(f"DEBUG — assignments tables found (present={present}, visible={visible})")
-
-    tables = page.locator('table[id^="tblAssign_"], #SP_Assignments table.tblassign, table.tblassign')
-    rows: List[List[str]] = []
-    for tbl in tables.all():
-        rows.extend(_parse_table_rows(page, tbl, student))
-
-    return rows, present
-
-def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[List[str]], Dict]:
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--disable-gpu","--no-sandbox"])
+# ---------- Public entry ----------
+def run_scrape(username: str, password: str, students: List[str]) -> List[dict]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--disable-features=IsolateOrigins,site-per-process"])
         context = browser.new_context()
-        context.set_default_timeout(20000)
         page = context.new_page()
 
-        _goto(page, LOGIN_URL, label="LOGIN_URL(start)")
-        print(f"DEBUG — landed: {page.url}")
+        ensure_logged_in(page, username, password)
 
-        ensure_logged_in_and_on_portal(page, username, password)
+        # Minor portal settle
+        safe_goto(page, PORTAL_HOME, "domcontentloaded")
 
-        print(f"DEBUG — UI SNAPSHOT — url: {page.url}")
-        sample = []
-        bt = " ".join(_body_text(page).split())
-        for token in ["Home","FAQs","District Website","Terms of Use","Assignments","Classes"]:
-            if token in bt:
-                sample.append(token)
-        print(f"DEBUG — UI SNAPSHOT — sample: {', '.join(sample) if sample else '(none)'}")
+        # Some portals flash a "Terms of Use" (or similar) page title in <h1>/<h2>
+        try:
+            page.wait_for_timeout(250)
+        except PlaywrightTimeoutError:
+            pass
 
-        all_rows: List[List[str]] = []
-        table_total = 0
+        all_rows: List[dict] = []
         for s in students:
-            stu_rows, tbl_count = extract_assignments_for_student(page, s)
-            print(f"DEBUG — class tables for {s}: {tbl_count}")
-            table_total += tbl_count
-            all_rows.extend(stu_rows)
+            rows = extract_assignments_for_student(page, s)
+            all_rows.extend(rows)
 
-        print(f"DEBUG — scraped {len(all_rows)} rows from portal")
-        context.close(); browser.close()
-        metrics = {"tables_seen": table_total, "rows": len(all_rows)}
-        return all_rows, metrics
+        context.close()
+        browser.close()
+
+        return all_rows
