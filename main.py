@@ -1,14 +1,13 @@
 import json
 import os
-import re
 from datetime import datetime, timezone
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials  # modern auth
 
 from scraper import run_scrape
 
-# ====== CONFIG ======
+# ====== SHEET COLUMNS ======
 HEADERS = [
     "ImportedAt", "Student", "Period", "Course", "Teacher",
     "DueDate", "AssignedDate", "Assignment",
@@ -17,37 +16,42 @@ HEADERS = [
     "SourceURL",
 ]
 
-# Unique key used for de-dup. Tweak if you want stricter/looser keys.
+# Columns used to build a unique key to prevent duplicates
 DEDUP_KEY_COLS = [
     "Student", "Period", "Course", "Assignment", "DueDate", "AssignedDate", "Score", "PtsPossible"
 ]
 
+
 def utc_timestamp_str() -> str:
-    # Keep UTC so runs from CI are consistent; easy to convert in Sheets
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def get_env_list(name: str) -> list[str]:
     raw = os.environ.get(name, "")
-    if not raw:
-        return []
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    return [s.strip() for s in raw.split(",") if s.strip()] if raw else []
+
 
 def open_sheet(spreadsheet_id: str, creds_json: str):
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds_dict = json.loads(creds_json)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    gc = gspread.authorize(creds)
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(credentials)
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.sheet1
-    # Ensure headers
+
+    # Ensure headers on row 1 (write exactly the first row, starting at A1)
     current = ws.row_values(1)
     if current != HEADERS:
-        # gspread changed the arg order (values first). Use correct order.
-        ws.update([HEADERS])
+        ws.update("A1", [HEADERS])
     return ws
+
 
 def as_key(row: dict) -> str:
     return "|".join(str(row.get(k, "")).strip() for k in DEDUP_KEY_COLS)
+
 
 def load_existing_keys(ws) -> set[str]:
     values = ws.get_all_values()
@@ -61,21 +65,17 @@ def load_existing_keys(ws) -> set[str]:
         keys.add(as_key(row_map))
     return keys
 
-def append_rows(ws, rows: list[dict]):
+
+def append_rows(ws, rows: list[dict]) -> int:
     if not rows:
         return 0
-    matrix = []
-    for r in rows:
-        matrix.append([r.get(h, "") for h in HEADERS])
-    # append_rows takes a list of lists
+    matrix = [[r.get(h, "") for h in HEADERS] for r in rows]
     ws.append_rows(matrix, value_input_option="RAW")
     return len(matrix)
 
-def cleanup_legacy_dups(ws):
-    """
-    Optional: dedupe existing sheet rows based on DEDUP_KEY_COLS.
-    Leaves the first occurrence, drops later duplicates.
-    """
+
+def cleanup_legacy_dups(ws) -> int:
+    """Remove older duplicate rows based on DEDUP_KEY_COLS; keep first occurrence."""
     values = ws.get_all_values()
     if not values or len(values) < 2:
         return 0
@@ -89,13 +89,14 @@ def cleanup_legacy_dups(ws):
         k = as_key(row_map)
         if k in seen:
             removed += 1
-            continue
-        seen.add(k)
-        keep.append(r)
+        else:
+            seen.add(k)
+            keep.append(r)
     if removed:
         ws.clear()
-        ws.update(keep)
+        ws.update("A1", keep)
     return removed
+
 
 def main():
     username = os.environ.get("PORTAL_USER", "")
@@ -106,14 +107,15 @@ def main():
 
     print(f"DEBUG — students: {students}")
 
-    rows_from_portal = run_scrape(username, password, students)  # list of dict rows, no ImportedAt
+    # Scrape -> list[dict] without ImportedAt
+    scraped_rows = run_scrape(username, password, students)
 
-    # Add ImportedAt
+    # Stamp import time
     ts = utc_timestamp_str()
-    for r in rows_from_portal:
+    for r in scraped_rows:
         r["ImportedAt"] = ts
 
-    print(f"DEBUG — scraped {len(rows_from_portal)} rows from portal")
+    print(f"DEBUG — scraped {len(scraped_rows)} rows from portal")
 
     if not spreadsheet_id or not creds_json:
         print("ERROR: Missing SPREADSHEET_ID or GOOGLE_CREDS_JSON")
@@ -121,17 +123,19 @@ def main():
 
     ws = open_sheet(spreadsheet_id, creds_json)
 
-    # De-dup against existing before appending
+    # Skip anything already in the sheet
     existing = load_existing_keys(ws)
-    new_rows = [r for r in rows_from_portal if as_key(r) not in existing]
+    pending = [r for r in scraped_rows if as_key(r) not in existing]
 
-    appended = append_rows(ws, new_rows)
+    appended = append_rows(ws, pending)
     removed = cleanup_legacy_dups(ws)
 
     print(
-        f"Imported {appended} new rows. Skipped as duplicates (before append): "
-        f"{len(rows_from_portal) - appended}. Removed legacy dups during cleanup: {removed}."
+        f"Imported {appended} new rows. "
+        f"Skipped as duplicates (before append): {len(scraped_rows) - appended}. "
+        f"Removed legacy dups during cleanup: {removed}."
     )
+
 
 if __name__ == "__main__":
     main()
