@@ -2,128 +2,208 @@
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 from typing import List, Dict, Tuple
 import re
-import time
 
 PORTAL_ROOT = "https://parentportal.cajonvalley.net"
 PORTAL_HOME = f"{PORTAL_ROOT}/Home/PortalMainPage"
 
-def _visible_text_sample(page, max_len=160) -> str:
-    # small helper for logging – sample visible text on the page
+# ---------------------------
+# small logging helpers
+# ---------------------------
+def _txt_sample(page, max_len=220) -> str:
     try:
-        txt = page.locator("body").inner_text(timeout=2000)
-        return re.sub(r"\s+", " ", txt).strip()[:max_len]
+        body = page.locator("body")
+        if body.count():
+            t = body.inner_text(timeout=2000)
+            return re.sub(r"\s+", " ", t).strip()[:max_len]
     except Exception:
-        return ""
+        pass
+    return ""
 
-def _goto(page, url: str, wait="domcontentloaded", timeout=15000):
+def _log(page, msg: str):
+    print(f"DEBUG — {msg}")
+
+# ---------------------------
+# navigation
+# ---------------------------
+def _goto(page, url: str, wait="domcontentloaded", timeout=20000):
     page.goto(url, wait_until=wait, timeout=timeout)
 
-def _ensure_logged_in(page, username: str, password: str, timeout=20000):
-    # Always start from base URL to reset session
-    _goto(page, PORTAL_ROOT, wait="domcontentloaded", timeout=timeout)
-
-    # Dismiss any “session timed out” alert dialog if it pops
+def _dismiss_any_timeout_dialog(page):
+    # Seen on this portal from time to time
     try:
-        dlg = page.get_by_role("button", name=re.compile(r"OK|Close|Continue", re.I))
-        if dlg.is_visible(timeout=1500):
-            dlg.click()
+        btn = page.get_by_role("button", name=re.compile(r"(OK|Continue|Close)", re.I))
+        if btn.count() and btn.first.is_visible():
+            btn.first.click()
     except Exception:
         pass
 
-    # Detect login form
-    login_fields = page.locator('input[name="PIN"], input#PIN, input[name="Password"], input#Password')
-    has_login = login_fields.count() > 0
+# ---------------------------
+# login helpers
+# ---------------------------
+PIN_CANDIDATES = [
+    'input#PIN',
+    'input[name="PIN"]',
+    'input[name*="PIN" i]',
+    'input[placeholder*="PIN" i]',
+    '//label[normalize-space()="PIN"]/following::input[1]',
+]
+PWD_CANDIDATES = [
+    'input#Password',
+    'input[name="Password"]',
+    'input[name*="Password" i]',
+    'input[type="password"]',
+    '//label[normalize-space()="Password"]/following::input[1]',
+]
 
-    if not has_login:
-        # Some gateways redirect straight to main page when cookie is valid.
-        # Force-open the login page to be certain.
+def _first_visible(page, selectors: List[str], wait_each=3000):
+    for sel in selectors:
         try:
-            _goto(page, PORTAL_ROOT + "/Account/LogOn", wait="domcontentloaded", timeout=timeout)
+            loc = page.locator(sel)
+            if loc.count():
+                try:
+                    loc.first.wait_for(state="visible", timeout=wait_each)
+                except Exception:
+                    # still try to use it if attached
+                    pass
+                if loc.first.is_visible():
+                    return loc.first
+        except Exception:
+            continue
+    return None
+
+def _get_login_fields(page) -> Tuple[object, object]:
+    """
+    Returns (pin_field, password_field) locators or (None, None).
+    Also supports a heuristic: find a password field, then pick the nearest
+    previous text input as the PIN field if direct selectors fail.
+    """
+    pwd = _first_visible(page, PWD_CANDIDATES, wait_each=2000)
+    pin = _first_visible(page, PIN_CANDIDATES, wait_each=2000)
+
+    if not pin and pwd:
+        # Heuristic: PIN is often the text input just before the password
+        try:
+            text_inputs = page.locator('input[type="text"], input:not([type])')
+            if text_inputs.count():
+                # take the first visible one on the page
+                for i in range(text_inputs.count()):
+                    cand = text_inputs.nth(i)
+                    if cand.is_visible():
+                        pin = cand
+                        break
         except Exception:
             pass
-        login_fields = page.locator('input[name="PIN"], input#PIN, input[name="Password"], input#Password')
-        has_login = login_fields.count() > 0
 
-    if has_login:
-        # Fill form (common variants)
-        try:
-            pin = page.locator('input[name="PIN"], input#PIN').first
-            pwd = page.locator('input[name="Password"], input#Password').first
-            pin.fill(username, timeout=5000)
-            pwd.fill(password, timeout=5000)
-        except Exception:
-            raise RuntimeError("Could not fill login form")
+    return (pin, pwd) if (pin and pwd) else (None, None)
 
-        # Click a “Login” button
+def _open_login_form(page):
+    # Always reset to root
+    _goto(page, PORTAL_ROOT, wait="domcontentloaded", timeout=20000)
+    _dismiss_any_timeout_dialog(page)
+
+    # Try explicit login paths (both variants that appear in the logs)
+    for path in ("/Account/LogOn", "/Account/Login"):
         try:
-            page.get_by_role("button", name=re.compile(r"Log\s*in|Sign\s*in|Login", re.I)).first.click()
+            _goto(page, PORTAL_ROOT + path, wait="domcontentloaded", timeout=20000)
+            pin, pwd = _get_login_fields(page)
+            if pin and pwd:
+                return (pin, pwd)
         except Exception:
-            # fallback: submit via Enter
+            pass
+
+    # Try clicking any visible “Login / Log On / Sign In” link or button
+    try:
+        link = page.get_by_role("link", name=re.compile(r"log\s*(on|in)|sign\s*in", re.I))
+        if link.count():
+            link.first.click()
+            page.wait_for_load_state("domcontentloaded")
+            pin, pwd = _get_login_fields(page)
+            if pin and pwd:
+                return (pin, pwd)
+    except Exception:
+        pass
+
+    # Last resort – hunt in-place
+    pin, pwd = _get_login_fields(page)
+    return (pin, pwd)
+
+def _ensure_logged_in(page, username: str, password: str, timeout=25000):
+    pin, pwd = _open_login_form(page)
+
+    _log(page, f"LOGIN DEBUG — url now: {page.url}")
+    _log(page, f"LOGIN DEBUG — body sample: {_txt_sample(page)}")
+
+    if not (pin and pwd):
+        raise RuntimeError("Could not find login form")
+
+    try:
+        pin.fill(username, timeout=12000)
+        pwd.fill(password, timeout=12000)
+    except Exception:
+        raise RuntimeError("Could not fill login form")
+
+    # Try to submit
+    try:
+        page.get_by_role("button", name=re.compile(r"log\s*(in|on)|sign\s*in", re.I)).first.click()
+    except Exception:
+        try:
             pwd.press("Enter")
-
-        # Navigate to the portal home after login
-        try:
-            _goto(page, PORTAL_HOME, wait="domcontentloaded", timeout=timeout)
-        except Exception:
-            # try committing once in case of the net::ERR_ABORTED on quick redirect
-            page.wait_for_timeout(600)
-            _goto(page, PORTAL_HOME, wait="domcontentloaded", timeout=timeout)
-    else:
-        # Already logged in – make sure we’re at the portal page
-        try:
-            _goto(page, PORTAL_HOME, wait="domcontentloaded", timeout=timeout)
         except Exception:
             pass
+
+    # Head to the main page (and handle quick abort by retrying once)
+    try:
+        _goto(page, PORTAL_HOME, wait="domcontentloaded", timeout=timeout)
+    except Exception:
+        page.wait_for_timeout(600)
+        _goto(page, PORTAL_HOME, wait="domcontentloaded", timeout=timeout)
 
 def _try_open_student_menu(page):
-    # Open any UI that reveals student names
-    # Common variants seen across PowerSchool-like portals
-    candidates = [
-        '#divStudentBanner',          # banner area w/ student name
+    for sel in [
+        '#divStudentBanner',
         'button[aria-controls*="Student"]',
         'button:has-text("Student")',
         'a:has-text("Student")',
         'a:has-text("Change Student")',
-    ]
-    for sel in candidates:
+    ]:
         try:
             loc = page.locator(sel)
             if loc.count() and loc.first.is_visible():
                 loc.first.click()
-                page.wait_for_timeout(150)
+                page.wait_for_timeout(100)
                 return True
         except Exception:
-            continue
+            pass
     return False
 
 def _switch_to_student(page, name: str) -> bool:
-    # First: click directly on the name if visible
+    # direct click on link
     name_xpath = f'//a[contains(normalize-space(.), "{name}") or contains(@title, "{name}")]'
     try:
         links = page.locator(name_xpath)
-        if links.count() > 0 and links.first.is_visible():
+        if links.count() and links.first.is_visible():
             links.first.click()
             page.wait_for_load_state("domcontentloaded")
             return True
     except Exception:
         pass
 
-    # Second: open a student menu, then click the name
+    # menu then click
     _try_open_student_menu(page)
     try:
         links = page.locator(name_xpath)
-        if links.count() > 0 and links.first.is_visible():
+        if links.count() and links.first.is_visible():
             links.first.click()
             page.wait_for_load_state("domcontentloaded")
             return True
     except Exception:
         pass
 
-    # Third: sometimes names are buttons, not links
+    # some portals render as buttons
     btn_xpath = f'//button[contains(normalize-space(.), "{name}")]'
     try:
         btns = page.locator(btn_xpath)
-        if btns.count() > 0 and btns.first.is_visible():
+        if btns.count() and btns.first.is_visible():
             btns.first.click()
             page.wait_for_load_state("domcontentloaded")
             return True
@@ -133,41 +213,32 @@ def _switch_to_student(page, name: str) -> bool:
     return False
 
 def _extract_tables_for_current_student(page) -> List[Dict]:
-    """
-    Scrape all assignment tables visible on the PortalMainPage.
-    We look for tables with id that starts with 'tblAssign_' which is how this portal renders lists.
-    """
     rows: List[Dict] = []
 
-    # In practice these tables appear after the section header which hints the course.
     tables = page.locator('table.tblassign, table[id^="tblAssign_"]')
-    tcount = tables.count()
-
-    # If the DOM is present but not yet visible, give it a moment
-    if tcount == 0:
-        # small staged waits
-        for _ in range(5):
+    count = tables.count()
+    if count == 0:
+        # staged waits to allow late rendering
+        for _ in range(6):
             page.wait_for_timeout(250)
-            tcount = page.locator('table.tblassign, table[id^="tblAssign_"]').count()
-            if tcount:
+            count = page.locator('table.tblassign, table[id^="tblAssign_"]').count()
+            if count:
                 break
 
-    for i in range(tcount):
+    for i in range(count):
         table = tables.nth(i)
 
-        # Derive a course label from the nearest header above this table
+        # derive course from nearest header above table
         course = ""
         try:
             hdr = table.locator("xpath=preceding::*[self::h1 or self::h2 or self::h3 or self::h4][1]")
             if hdr.count():
                 course = re.sub(r"\s+", " ", hdr.first.inner_text().strip())
                 if re.search(r"Assignments?\s+Show\s+All", course, re.I):
-                    # not actionable – generic “Assignments Show All” header
                     course = ""
         except Exception:
             pass
 
-        # Now read table rows
         try:
             body_rows = table.locator("tbody tr")
             for r in range(body_rows.count()):
@@ -176,21 +247,17 @@ def _extract_tables_for_current_student(page) -> List[Dict]:
                 c = tds.count()
                 if c == 0:
                     continue
+                cells = [re.sub(r"\s+", " ", (tds.nth(k).inner_text() or "").strip()) for k in range(c)]
 
-                text_cells = [re.sub(r"\s+", " ", (tds.nth(k).inner_text() or "").strip()) for k in range(c)]
-
-                # Heuristics for the common column layout on this portal:
-                #  Assignment | Due Date | Assigned Date | Points Possible | Score | % | Status | Comments
-                # Some classes omit Assigned Date – so we guard with indexes.
                 def cell(idx, default=""):
-                    return text_cells[idx] if idx < len(text_cells) else default
+                    return cells[idx] if idx < len(cells) else default
 
                 assignment = cell(0)
                 due_date = cell(1)
                 assigned_date = cell(2)
-                # If the second cell looks like a number, the table might be: Assignment | Pos | Score | %
+
+                # layout variant: when cell(1) is numeric, it's Pos
                 if re.fullmatch(r"\d+(\.\d+)?", due_date):
-                    # shift fields right
                     assigned_date = ""
                     pts_possible = cell(1)
                     score = cell(2)
@@ -200,15 +267,9 @@ def _extract_tables_for_current_student(page) -> List[Dict]:
                     score = cell(4)
                     pct = cell(5)
 
-                status = ""
-                comments = ""
-                # Try to find status/comments if present
-                if len(text_cells) >= 7:
-                    status = cell(6)
-                if len(text_cells) >= 8:
-                    comments = cell(7)
+                status = cell(6, "")
+                comments = cell(7, "")
 
-                # Derive status if blank
                 if not status:
                     if re.search(r"missing", assignment, re.I):
                         status = "MISSING"
@@ -216,9 +277,9 @@ def _extract_tables_for_current_student(page) -> List[Dict]:
                         status = "OK"
 
                 rows.append({
-                    "Period": "",                             # not reliably on this page
+                    "Period": "",
                     "Course": course,
-                    "Teacher": "",                            # set by header if available below
+                    "Teacher": "",
                     "DueDate": due_date,
                     "AssignedDate": assigned_date,
                     "Assignment": assignment,
@@ -232,16 +293,13 @@ def _extract_tables_for_current_student(page) -> List[Dict]:
         except Exception:
             continue
 
-    # Try to capture teacher name from a nearby header on the page (appears next to the course block)
+    # try to populate Teacher from headers on the page
     try:
-        teacher_hdr = page.locator("xpath=//h1|//h2|//h3|//h4")
-        if teacher_hdr.count():
-            header_text = " ".join([
-                re.sub(r"\s+", " ", teacher_hdr.nth(i).inner_text().strip())
-                for i in range(min(teacher_hdr.count(), 4))
-            ])
-            # crude teacher extraction like "Scarbrough, P"
-            m = re.search(r"([A-Z][a-z]+,\s*[A-Z](?:\.)?)", header_text)
+        heads = page.locator("xpath=//h1|//h2|//h3|//h4")
+        if heads.count():
+            joined = " ".join([re.sub(r"\s+", " ", heads.nth(i).inner_text().strip())
+                               for i in range(min(4, heads.count()))])
+            m = re.search(r"([A-Z][a-z]+,\s*[A-Z](?:\.)?)", joined)
             teacher = m.group(1) if m else ""
             for r in rows:
                 if not r["Teacher"]:
@@ -252,37 +310,30 @@ def _extract_tables_for_current_student(page) -> List[Dict]:
     return rows
 
 def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[Dict], Dict]:
-    scraped_rows: List[Dict] = []
-    metrics = {
-        "students": students,
-        "per_student_table_counts": {},
-        "ui_url": "",
-        "ui_sample": ""
-    }
+    scraped: List[Dict] = []
+    metrics = {"students": students, "per_student_table_counts": {}, "ui_url": "", "ui_sample": ""}
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
         page = browser.new_page()
 
-        _ensure_logged_in(page, username, password, timeout=25000)
-
+        _ensure_logged_in(page, username, password, timeout=30000)
         metrics["ui_url"] = page.url
-        metrics["ui_sample"] = _visible_text_sample(page)
+        metrics["ui_sample"] = _txt_sample(page)
 
-        # Iterate students
         for s in students:
-            switched = _switch_to_student(page, s)
-            if not switched:
+            ok = _switch_to_student(page, s)
+            if not ok:
+                _log(page, f"could not locate a picker for '{s}'; skipping switch")
                 metrics["per_student_table_counts"][s] = 0
                 continue
 
             tables_rows = _extract_tables_for_current_student(page)
             metrics["per_student_table_counts"][s] = len(tables_rows)
-            # Attach student name on each row
             for r in tables_rows:
                 r["Student"] = s
-            scraped_rows.extend(tables_rows)
+            scraped.extend(tables_rows)
 
         browser.close()
 
-    return scraped_rows, metrics
+    return scraped, metrics
