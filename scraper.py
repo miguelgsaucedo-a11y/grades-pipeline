@@ -9,7 +9,9 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 PORTAL_BASE = "https://parentportal.cajonvalley.net"
 PORTAL_HOME = f"{PORTAL_BASE}/Home/PortalMainPage"
 
+# also try the site root because it contains the 'ParentPortal Login' panel
 LOGON_PATHS = [
+    "/",  # root page contains the login block with PIN/Password
     "/Account/LogOn",
     "/Account/Login",
     "/Account/LogOn?ReturnUrl=%2FHome%2FPortalMainPage",
@@ -23,38 +25,36 @@ def _trim(s: str, n: int = 280) -> str:
     s = (s or "").strip().replace("\n", " ")
     return s[:n] + ("…" if len(s) > n else "")
 
-# ---------- helpers that work across all frames ----------
+# ---------- frame helpers ----------
 
 def _all_frames(page):
-    # main frame first for speed/consistency
     seen = set()
-    result = []
+    res = []
     try:
         mf = page.main_frame
         if mf:
-            result.append(mf)
             seen.add(id(mf))
+            res.append(mf)
     except Exception:
         pass
     try:
         for fr in page.frames:
             if id(fr) not in seen:
-                result.append(fr)
+                res.append(fr)
     except Exception:
         pass
-    return result
+    return res
 
 def _body_text_any(page, timeout=1200) -> str:
-    # collect a bit of text from any visible frame/body for diagnostics
-    chunks: List[str] = []
+    parts = []
     for fr in _all_frames(page):
         try:
             t = fr.locator("body").inner_text(timeout=timeout)
             if t:
-                chunks.append(_trim(t, 160))
+                parts.append(_trim(t, 160))
         except Exception:
             pass
-    return " | ".join(chunks)[:600]
+    return " | ".join(parts)[:600]
 
 def _first_visible(page, selector: str):
     for fr in _all_frames(page):
@@ -79,111 +79,149 @@ def _click_if_visible(page, selector: str) -> bool:
             return False
     return False
 
-# ---------- login-related utilities ----------
+# ---------- login UX quirks ----------
 
 def _dismiss_timeout_any(page) -> None:
-    """
-    Handles the 'Your Session Has Timed Out... Click OK to Continue' modal/overlay
-    even if it is inside an iframe.
-    """
-    body = _body_text_any(page)
-    if ("Session Has Timed Out" not in body) and ("OK to Continue" not in body):
+    txt = _body_text_any(page)
+    if ("Session Has Timed Out" not in txt) and ("OK to Continue" not in txt):
         return
-
-    ok_selectors = [
+    for sel in [
         'button:has-text("OK")',
         'input[type=button][value="OK"]',
         'a:has-text("OK")',
         'button:has-text("Continue")',
         'a:has-text("Continue")',
-    ]
-    for sel in ok_selectors:
+    ]:
         if _click_if_visible(page, sel):
             dbg("login DEBUG — dismissed timeout dialog")
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(350)
             break
     try:
         page.once("dialog", lambda d: d.accept())
     except Exception:
         pass
 
-def _wait_login_fields_any(page, timeout_ms=8000) -> Tuple[bool, object]:
+# broadened selectors — include PIN variations
+PIN_SELECTORS = [
+    "#PIN",
+    "input[name=PIN]",
+    'input[id*="PIN"]',
+    'input[placeholder*="PIN" i]',
+    'input[aria-label*="PIN" i]',
+]
+USER_SELECTORS = [
+    "#UserName",
+    "input[name=UserName]",
+    'input[name="username" i]',
+    'input[id*="user" i]',
+] + PIN_SELECTORS
+
+PASS_SELECTORS = [
+    "#Password",
+    "input[name=Password]",
+    'input[id*="pass" i]',
+    'input[type="password"]',
+    'input[placeholder*="password" i]',
+    'input[aria-label*="password" i]',
+]
+
+SUBMIT_SELECTORS = [
+    'button[type=submit]',
+    'input[type=submit]',
+    'button:has-text("Log On")',
+    'button:has-text("Login")',
+    'button:has-text("Sign In")',
+    'input[type=button][value="Log On"]',
+    'input[type=button][value="Login"]',
+    'a:has-text("Log On")',
+    'a:has-text("Login")',
+    'a:has-text("Sign In")',
+]
+
+def _wait_login_fields_any(page, timeout_ms=8000) -> Tuple[bool, object, str, str]:
     """
-    Wait (poll) for login fields in any frame, return (found, frame_with_fields).
+    Returns (found, frame, user_selector, pass_selector).
+    User selector may be a PIN field.
     """
     deadline = time.time() + timeout_ms / 1000.0
-    user_sels = ["#UserName", "input[name=UserName]", 'input[type="text"][name*=User]', 'input[id*=User]']
-    pass_sels = ["#Password", "input[name=Password]", 'input[type="password"]', 'input[id*=Pass]']
-
     while time.time() < deadline:
         for fr in _all_frames(page):
-            u_ok = False
-            p_ok = False
-            for us in user_sels:
+            u_sel = ""
+            p_sel = ""
+            # find username/PIN
+            for us in USER_SELECTORS:
                 try:
                     if fr.locator(us).first.is_visible():
-                        u_ok = True
+                        u_sel = us
                         break
                 except Exception:
                     pass
-            for ps in pass_sels:
+            # try label-based for PIN
+            if not u_sel:
+                try:
+                    inp = fr.get_by_label(re.compile(r"\bPIN\b", re.I))
+                    if inp and inp.is_visible():
+                        u_sel = "LABEL::PIN"
+                except Exception:
+                    pass
+            # find password
+            for ps in PASS_SELECTORS:
                 try:
                     if fr.locator(ps).first.is_visible():
-                        p_ok = True
+                        p_sel = ps
                         break
                 except Exception:
                     pass
-            if u_ok and p_ok:
-                return True, fr
+            if not p_sel:
+                try:
+                    inp = fr.get_by_label(re.compile(r"password", re.I))
+                    if inp and inp.is_visible():
+                        p_sel = "LABEL::PASSWORD"
+                except Exception:
+                    pass
+            if u_sel and p_sel:
+                return True, fr, u_sel, p_sel
         page.wait_for_timeout(120)
-    return False, None
+    return False, None, "", ""
 
-def _navigate_to_login(page) -> Tuple[bool, object]:
+def _navigate_to_login(page) -> Tuple[bool, object, str, str]:
     """
-    Multi-strategy approach:
-      1) Go to root/PortalMainPage, clear any timeout dialog.
-      2) Click any 'Log On / Login / Sign In' link in any frame.
-      3) Try each known login path (incl. ReturnUrl) with a referer in place.
-      4) If we hit Error.htm, call /Account/LogOff, back to root, and retry.
-    Returns (found_fields, frame).
+    Try root + explicit login URLs. Click 'ParentPortal Login' triggers if present.
     """
     for attempt in range(4):
         try:
             page.goto(PORTAL_HOME, wait_until="domcontentloaded")
         except Exception:
             pass
-
         _dismiss_timeout_any(page)
 
-        # Strategy A: find a login link in any frame
+        # Click obvious login triggers on any page
         for sel in [
-            'a[href*="/Account/LogOn"]',
-            'a[href*="/Account/Login"]',
+            'a:has-text("ParentPortal Login")',
+            'a:has-text("Parent Portal Login")',
             'a:has-text("Log On")',
-            'a:has-text("Log In")',
+            'a:has-text("Login")',
             'a:has-text("Sign In")',
-            'button:has-text("Log On")',
+            'button:has-text("ParentPortal Login")',
             'button:has-text("Login")',
             'button:has-text("Sign In")',
         ]:
             if _click_if_visible(page, sel):
-                found, fr = _wait_login_fields_any(page, timeout_ms=6000)
-                if found:
-                    return True, fr
+                ok, fr, us, ps = _wait_login_fields_any(page, timeout_ms=6000)
+                if ok:
+                    return True, fr, us, ps
 
-        # Strategy B: try direct login URLs (we already have a referer now)
+        # Try each login path, including the site root
         for path in LOGON_PATHS:
+            url = f"{PORTAL_BASE}{path}" if path.startswith("/") else f"{PORTAL_BASE}/{path}"
             try:
-                page.goto(f"{PORTAL_BASE}{path}&_={int(time.time()*1000)}" if "?" in path
-                          else f"{PORTAL_BASE}{path}?_={int(time.time()*1000)}",
-                          wait_until="domcontentloaded")
+                page.goto(url, wait_until="domcontentloaded")
             except Exception:
                 pass
 
-            # If server throws ASP.NET Error page, back off this path
+            # ASP.NET error page protection
             if "/Error.htm" in page.url or "An error occurred while processing your request" in _body_text_any(page):
                 dbg(f"login DEBUG — got error page when requesting {path}; backing out")
-                # Try to reset server-side auth state
                 try:
                     page.goto(f"{PORTAL_BASE}/Account/LogOff", wait_until="domcontentloaded")
                 except Exception:
@@ -195,62 +233,87 @@ def _navigate_to_login(page) -> Tuple[bool, object]:
                 _dismiss_timeout_any(page)
                 continue
 
-            found, fr = _wait_login_fields_any(page, timeout_ms=6000)
-            if found:
-                return True, fr
+            # On root/home there may be a collapsed login panel — click it
+            for sel in [
+                'a:has-text("ParentPortal Login")',
+                'button:has-text("ParentPortal Login")',
+                'a:has-text("Parent Portal Login")',
+                'button:has-text("Parent Portal Login")',
+            ]:
+                _click_if_visible(page, sel)
 
-        # Small wait before next attempt
+            ok, fr, us, ps = _wait_login_fields_any(page, timeout_ms=6000)
+            if ok:
+                return True, fr, us, ps
+
         page.wait_for_timeout(500)
 
     dbg(f"login DEBUG — url now: {page.url}")
-    dbg(f"login DEBUG — body: {_trim(_body_text_any(page), 240)}")
-    return False, None
+    dbg(f"login DEBUG — body: {_trim(_body_text_any(page), 260)}")
+    return False, None, "", ""
 
 def login(page, username: str, password: str) -> None:
-    found, fr = _navigate_to_login(page)
+    found, fr, user_sel, pass_sel = _navigate_to_login(page)
     dbg(f"login fields visible: {found}")
     if not found:
         raise RuntimeError("Login form not found — cannot proceed.")
 
-    target = fr or page  # page and frame share same fill/click API
+    target = fr or page
 
-    # Fill username
-    for sel in ["#UserName", "input[name=UserName]", 'input[type="text"][name*=User]', 'input[id*=User]']:
+    def _fill(sel: str, val: str):
+        if sel == "LABEL::PIN":
+            try:
+                target.get_by_label(re.compile(r"\bPIN\b", re.I)).fill(val)
+                return True
+            except Exception:
+                return False
+        if sel == "LABEL::PASSWORD":
+            try:
+                target.get_by_label(re.compile(r"password", re.I)).fill(val)
+                return True
+            except Exception:
+                return False
         try:
-            if target.locator(sel).first.is_visible():
-                target.fill(sel, username)
-                break
+            target.fill(sel, val)
+            return True
         except Exception:
-            pass
+            return False
 
-    # Fill password
-    for sel in ["#Password", "input[name=Password]", 'input[type="password"]', 'input[id*=Pass]']:
+    # Fill PIN/username and password
+    _filled_u = _fill(user_sel, username)
+    if not _filled_u:
+        # last-ditch: any text/tel/number input
+        for sel in ['input[type="text"]', 'input[type="tel"]', 'input[type="number"]', "input:not([type])"]:
+            try:
+                loc = target.locator(sel).first
+                if loc and loc.is_visible():
+                    loc.fill(username)
+                    _filled_u = True
+                    break
+            except Exception:
+                pass
+
+    _filled_p = _fill(pass_sel, password)
+    if not _filled_p:
         try:
-            if target.locator(sel).first.is_visible():
-                target.fill(sel, password)
-                break
+            target.locator('input[type="password"]').first.fill(password)
+            _filled_p = True
         except Exception:
             pass
 
     # Submit
-    for sel in [
-        'button[type=submit]',
-        'input[type=submit]',
-        'button:has-text("Log On")',
-        'button:has-text("Login")',
-        'input[type=button][value="Log On"]',
-        'input[type=button][value="Login"]',
-        'a:has-text("Log On")',
-        'a:has-text("Login")',
-    ]:
+    clicked = False
+    for sel in SUBMIT_SELECTORS:
         if _click_if_visible(target, sel):
+            clicked = True
             break
-    try:
-        target.keyboard.press("Enter")
-    except Exception:
-        pass
+    if not clicked:
+        try:
+            target.keyboard.press("Enter")
+        except Exception:
+            pass
 
-    # Wait until we appear to be inside the portal
+    # Wait until portal page is visible
     deadline = time.time() + 20
     while time.time() < deadline:
         try:
@@ -270,7 +333,7 @@ def login(page, username: str, password: str) -> None:
         time.sleep(0.3)
     dbg("after login: portal loaded")
 
-# ---------- student switching & scraping ----------
+# ---------- student switching & scraping (unchanged core) ----------
 
 def _casefold(s: str) -> str:
     return (s or "").casefold()
@@ -291,7 +354,6 @@ def switch_to_student(page, student: str) -> bool:
     except Exception:
         pass
 
-    # tiles/cards
     for sel in [
         ".studentTile a", ".studentTile",
         "a.card, .card a, .tile a, .tile",
@@ -317,7 +379,6 @@ def switch_to_student(page, student: str) -> bool:
         except Exception:
             pass
 
-    # dropdown
     for sel in ["select#ddlStudent", "select[name*=Student]", "select:has(option)", "[role=combobox]"]:
         try:
             el = page.locator(sel).first
@@ -341,7 +402,6 @@ def switch_to_student(page, student: str) -> bool:
         except Exception:
             pass
 
-    # generic link
     try:
         link = page.locator(f"a:has-text('{student}')").first
         if link and link.is_visible():
