@@ -83,8 +83,25 @@ def _dismiss_timeout_if_present(page: Page) -> None:
         pass
 
 
-def _goto(page: Page, url: str, timeout: int = 20000) -> None:
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+def _goto(page: Page, url: str, timeout: int = 20000, label: str | None = None) -> None:
+    """
+    Robust navigation that tolerates client-side redirects that cause
+    net::ERR_ABORTED. We retry with wait_until='commit' and keep going.
+    """
+    tag = label or url
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        return
+    except Exception as e1:
+        print(f"DEBUG — goto({tag}) domcontentloaded aborted: {e1}. Retrying with 'commit'.")
+        try:
+            page.goto(url, wait_until="commit", timeout=timeout)
+            # Let the next document begin; don't force another navigation
+            page.wait_for_load_state("domcontentloaded", timeout=timeout)
+            return
+        except Exception as e2:
+            # As a last resort, proceed with whatever the browser has
+            print(f"DEBUG — goto({tag}) commit fallback also raised: {e2}. Continuing at {page.url}.")
 
 
 def _first_visible(page: Page, selectors: List[str], timeout: int = 2000) -> Locator | None:
@@ -114,9 +131,9 @@ def _first_by_label(page: Page, labels: List[str], timeout: int = 2000) -> Locat
 def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: str) -> None:
     """
     Always start at the root (PIN/Password/Login), submit the form, then
-    force-navigate to /Home/PortalMainPage.
+    force-navigate to /Home/PortalMainPage (using robust _goto).
     """
-    _goto(page, LOGIN_URL)
+    _goto(page, LOGIN_URL, label="LOGIN_URL")
     _dismiss_timeout_if_present(page)
 
     # Sometimes we arrive already on the portal main page
@@ -125,7 +142,7 @@ def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: s
 
     # If error page or public marketing home, try again
     if _is_error_page(page) or _is_public_home(page):
-        _goto(page, LOGIN_URL)
+        _goto(page, LOGIN_URL, label="LOGIN_URL(retry)")
         _dismiss_timeout_if_present(page)
 
     # Find PIN / Password / Login on the root page
@@ -153,7 +170,7 @@ def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: s
         print("ERROR: Login form not found — cannot proceed.")
         return
 
-    # Submit
+    # Submit credentials
     pin.fill(pin_value)
     pwd.fill(password_value)
     login_btn.click()
@@ -161,7 +178,7 @@ def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: s
     _dismiss_timeout_if_present(page)
 
     # Canonical destination after login
-    _goto(page, PORTAL_HOME)
+    _goto(page, PORTAL_HOME, label="PORTAL_HOME")
     _dismiss_timeout_if_present(page)
     print("DEBUG — after login: portal loaded")
 
@@ -427,13 +444,13 @@ def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[
         page = context.new_page()
 
         # Always start at root login page
-        _goto(page, LOGIN_URL)
+        _goto(page, LOGIN_URL, label="LOGIN_URL(start)")
         print(f"DEBUG — landed: {page.url}")
 
         ensure_logged_in_and_on_portal(page, username, password)
         if "PortalMainPage" not in page.url:
-            # As a last resort, try nudging to home again
-            _goto(page, PORTAL_HOME)
+            # Nudge again (robust goto)
+            _goto(page, PORTAL_HOME, label="PORTAL_HOME(nudge)")
 
         # Debug UI snapshot for triage
         print(f"DEBUG — UI SNAPSHOT — url: {page.url}")
