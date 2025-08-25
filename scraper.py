@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Tuple
@@ -10,10 +9,10 @@ from typing import Dict, List, Tuple
 from playwright.sync_api import sync_playwright, Page, Locator
 
 # ------------------------------
-# Portal URLs & simple helpers
+# URLs & constants
 # ------------------------------
 BASE = "https://parentportal.cajonvalley.net"
-LOGIN_URL = BASE  # the root shows the actual login form (PIN / Password / Login)
+LOGIN_URL = BASE  # the root shows the PIN / Password / Login
 PORTAL_HOME = f"{BASE}/Home/PortalMainPage"
 
 PUBLIC_HOME_MARKERS = [
@@ -24,9 +23,11 @@ PUBLIC_HOME_MARKERS = [
     "How to make online payments",
     "Terms of Use",
 ]
-ERROR_MARKERS = [
-    "An error occurred while processing your request",
-    "Error.htm?aspxerrorpath=",
+
+ASSIGNMENT_TEXT_MARKERS = [
+    "No Assignments Available",
+    "No Current Assignments",
+    "No Assignments",
 ]
 
 HEADERS = [
@@ -46,31 +47,21 @@ HEADERS = [
     "SourceURL",
 ]
 
-
+# ------------------------------
+# Small helpers
+# ------------------------------
 def now_stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _body_text(page: Page) -> str:
     try:
-        return page.locator("body").inner_text(timeout=3000)
+        return page.locator("body").inner_text(timeout=2500)
     except Exception:
         return ""
 
 
-def _is_public_home(page: Page) -> bool:
-    txt = _body_text(page).lower()
-    return any(m.lower() in txt for m in PUBLIC_HOME_MARKERS)
-
-
-def _is_error_page(page: Page) -> bool:
-    return ("Error.htm" in page.url) or any(
-        m.lower() in _body_text(page).lower() for m in ERROR_MARKERS
-    )
-
-
 def _dismiss_timeout_if_present(page: Page) -> None:
-    """Dismiss 'Your Session Has Timed Out' dialog if visible."""
     try:
         dlg = page.get_by_role("dialog")
         if dlg.is_visible():
@@ -78,34 +69,31 @@ def _dismiss_timeout_if_present(page: Page) -> None:
             if ok.is_visible():
                 print("DEBUG — login DEBUG — dismissed timeout dialog")
                 ok.click()
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(300)
     except Exception:
         pass
 
 
 def _goto(page: Page, url: str, timeout: int = 20000, label: str | None = None) -> None:
-    """
-    Robust navigation that tolerates client-side redirects that cause
-    net::ERR_ABORTED. We retry with wait_until='commit' and keep going.
-    """
+    """Resilient navigation that tolerates client-side redirects (ERR_ABORTED)."""
     tag = label or url
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         return
     except Exception as e1:
-        print(f"DEBUG — goto({tag}) domcontentloaded aborted: {e1}. Retrying with 'commit'.")
+        print(
+            f"DEBUG — goto({tag}) domcontentloaded aborted: {e1}. "
+            f"Retrying with 'commit'."
+        )
         try:
             page.goto(url, wait_until="commit", timeout=timeout)
-            # Let the next document begin; don't force another navigation
             page.wait_for_load_state("domcontentloaded", timeout=timeout)
             return
         except Exception as e2:
-            # As a last resort, proceed with whatever the browser has
             print(f"DEBUG — goto({tag}) commit fallback also raised: {e2}. Continuing at {page.url}.")
 
 
-def _first_visible(page: Page, selectors: List[str], timeout: int = 2000) -> Locator | None:
-    """Return first visible locator among CSS selectors or None."""
+def _first_visible(page: Page, selectors: List[str], timeout: int = 1500) -> Locator | None:
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -116,8 +104,7 @@ def _first_visible(page: Page, selectors: List[str], timeout: int = 2000) -> Loc
     return None
 
 
-def _first_by_label(page: Page, labels: List[str], timeout: int = 2000) -> Locator | None:
-    """Return first visible locator found by label text or None."""
+def _first_by_label(page: Page, labels: List[str], timeout: int = 1500) -> Locator | None:
     for label in labels:
         try:
             loc = page.get_by_label(re.compile(label, re.I)).first
@@ -129,23 +116,10 @@ def _first_by_label(page: Page, labels: List[str], timeout: int = 2000) -> Locat
 
 
 def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: str) -> None:
-    """
-    Always start at the root (PIN/Password/Login), submit the form, then
-    force-navigate to /Home/PortalMainPage (using robust _goto).
-    """
+    """Open root login, submit, then land on the canonical portal home."""
     _goto(page, LOGIN_URL, label="LOGIN_URL")
     _dismiss_timeout_if_present(page)
 
-    # Sometimes we arrive already on the portal main page
-    if "PortalMainPage" in page.url:
-        return
-
-    # If error page or public marketing home, try again
-    if _is_error_page(page) or _is_public_home(page):
-        _goto(page, LOGIN_URL, label="LOGIN_URL(retry)")
-        _dismiss_timeout_if_present(page)
-
-    # Find PIN / Password / Login on the root page
     pin = _first_by_label(page, [r"\bPIN\b"]) or _first_visible(
         page, ['input[name*="pin" i]', 'input[id*="pin" i]', 'input[type="text"]']
     )
@@ -157,7 +131,7 @@ def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: s
     for name in [r"log\s*in", r"log\s*on", r"sign\s*in"]:
         try:
             cand = page.get_by_role("button", name=re.compile(name, re.I)).first
-            if cand.is_visible(timeout=1000):
+            if cand.is_visible(timeout=900):
                 login_btn = cand
                 break
         except Exception:
@@ -165,111 +139,169 @@ def ensure_logged_in_and_on_portal(page: Page, pin_value: str, password_value: s
 
     login_visible = bool(pin and pwd and login_btn)
     print(f"DEBUG — login fields visible: {login_visible}")
-
     if not login_visible:
         print("ERROR: Login form not found — cannot proceed.")
         return
 
-    # Submit credentials
     pin.fill(pin_value)
     pwd.fill(password_value)
     login_btn.click()
     page.wait_for_load_state("domcontentloaded", timeout=20000)
     _dismiss_timeout_if_present(page)
 
-    # Canonical destination after login
     _goto(page, PORTAL_HOME, label="PORTAL_HOME")
     _dismiss_timeout_if_present(page)
     print("DEBUG — after login: portal loaded")
 
 
 def expand_header_if_collapsed(page: Page) -> None:
-    """Open hamburger menu if the navbar is collapsed so header links/picker appear."""
+    """Open hamburger if needed so header controls are visible."""
     try:
         toggler = page.locator(
             'button.navbar-toggler, button[aria-label*="Toggle"], button[aria-expanded="false"]'
         ).first
-        if toggler.is_visible(timeout=1200):
+        if toggler.is_visible(timeout=900):
             toggler.click()
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(200)
     except Exception:
         pass
 
 
-def ui_snapshot(page: Page) -> str:
-    """Collect a small sample of visible nav text for debugging."""
-    txt = " ".join(_body_text(page).split())
-    sample = []
-    for token in [
-        "Home",
-        "FAQs",
-        "District Website",
-        "Forget Your PIN?",
-        "Reset Your Password",
-        "online payments",
-        "Terms of Use",
-    ]:
-        if token in txt:
-            sample.append(token)
-    return ", ".join(sample) if sample else "(none)"
+def _click_home_or_assignments(page: Page) -> None:
+    """Nudge UI to the Home/Assignments area in case we’re on a different tab."""
+    expand_header_if_collapsed(page)
+
+    # Try an explicit "Home" nav first
+    for role in ("link", "button"):
+        try:
+            el = page.get_by_role(role, name=re.compile(r"^\s*home\s*$", re.I)).first
+            if el.is_visible(timeout=700):
+                el.click()
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+                break
+        except Exception:
+            pass
+
+    # If there’s an Assignments tab/link, try that too
+    for role in ("tab", "link", "button"):
+        try:
+            el = page.get_by_role(role, name=re.compile(r"assignments?", re.I)).first
+            if el.is_visible(timeout=700):
+                el.click()
+                page.wait_for_timeout(400)
+                break
+        except Exception:
+            pass
 
 
 def switch_to_student(page: Page, student_name: str) -> bool:
     """
-    Switch to a student either via a picker/dropdown (preferred) or by clicking
-    their name in the header/menu as a fallback.
+    Switch to a student via picker or header link; then ensure we’re on Home.
     """
     expand_header_if_collapsed(page)
 
     picker_candidates = [
-        "#divStudentBanner",          # container that often wraps the picker
+        "#divStudentBanner",
         "#ddlStudent",
         "#studentPicker",
         '[id*="Student"][role="button"]',
     ]
 
+    # Try a dropdown/picker
     for sel in picker_candidates:
         try:
             el = page.locator(sel).first
             if el.is_visible(timeout=800):
                 el.click()
-                # try menu items first
+                # menu option or listbox option
                 try:
-                    page.get_by_role("menuitem", name=re.compile(student_name, re.I)).first.click(timeout=3000)
+                    page.get_by_role("menuitem", name=re.compile(student_name, re.I)).first.click(timeout=2500)
+                    print(f"DEBUG — switched via menu to student '{student_name}'")
+                    _goto(page, PORTAL_HOME, label="PORTAL_HOME(after switch)")
                     return True
                 except Exception:
                     pass
-                # or a listbox option
                 try:
-                    page.get_by_role("option", name=re.compile(student_name, re.I)).first.click(timeout=3000)
+                    page.get_by_role("option", name=re.compile(student_name, re.I)).first.click(timeout=2500)
+                    print(f"DEBUG — switched via option to student '{student_name}'")
+                    _goto(page, PORTAL_HOME, label="PORTAL_HOME(after switch)")
                     return True
                 except Exception:
                     pass
         except Exception:
             pass
 
-    # Fallback: click the student's name text if it is a link/button in the header
+    # Fallback: directly click the student’s name if it’s a header link
     try:
-        expand_header_if_collapsed(page)
         link = page.get_by_text(re.compile(rf"\b{re.escape(student_name)}\b", re.I)).first
-        if link.is_visible(timeout=1500):
+        if link.is_visible(timeout=900):
             link.click()
+            print(f"DEBUG — switched via header text to student '{student_name}'")
+            _goto(page, PORTAL_HOME, label="PORTAL_HOME(after switch)")
             return True
     except Exception:
         pass
+
+    print(f"DEBUG — could not locate a picker for '{student_name}'; skipping switch")
+    return False
+
+
+def _any_assignment_table_visible(page: Page, timeout: int) -> bool:
+    """Check a handful of patterns for the assignment tables or empty-state text."""
+    # Known tables
+    selectors = [
+        'table[id^="tblAssign_"]',
+        "#SP_Assignments table.tblassign",
+        "table.tblassign",
+    ]
+    for sel in selectors:
+        try:
+            if page.locator(sel).first.is_visible(timeout=timeout):
+                return True
+        except Exception:
+            pass
+
+    # Empty-state texts
+    for txt in ASSIGNMENT_TEXT_MARKERS:
+        try:
+            if page.locator(f'text="{txt}"').first.is_visible(timeout=timeout):
+                return True
+        except Exception:
+            pass
 
     return False
 
 
 def ensure_assignments_ready(page: Page) -> bool:
-    """Wait for any assignments table or an explicit 'No Assignments Available' text."""
-    try:
-        page.wait_for_selector('table[id^="tblAssign_"], text="No Assignments Available"', timeout=12000)
-        return True
-    except Exception:
-        return False
+    """
+    Make sure the assignments panel is on-screen and loaded.
+    We nudge the UI, scroll to trigger lazy-loads, and poll.
+    """
+    if "PortalMainPage" not in page.url:
+        _goto(page, PORTAL_HOME, label="ensure_assignments_ready->home")
+
+    # Up to ~20s total, with nudges in between
+    for attempt in range(1, 5):
+        # Try fast path first
+        if _any_assignment_table_visible(page, timeout=2000):
+            return True
+
+        # Nudge the UI (Home / Assignments) and scroll to trigger lazy loads
+        _click_home_or_assignments(page)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(400)
+        page.evaluate("window.scrollTo(0, 0)")
+
+        # After the nudge, give it a longer wait
+        if _any_assignment_table_visible(page, timeout=5000):
+            return True
+
+    return False
 
 
+# ------------------------------
+# Parsing
+# ------------------------------
 @dataclass
 class ClassContext:
     period: str
@@ -278,14 +310,8 @@ class ClassContext:
 
 
 def _extract_class_context_for_table(page: Page, table: Locator) -> ClassContext:
-    """
-    Heuristics to capture course/period/teacher around an assignment table.
-    We look in the nearest 'panel' ancestor and its header; fall back to
-    scanning preceding headings.
-    """
     header_text = ""
     try:
-        # typical bootstrap/asp.net panel containers
         header = table.locator(
             'xpath=ancestor::div[contains(@class,"panel") or contains(@class,"card")][1]'
             '//h3 | ancestor::div[contains(@class,"panel") or contains(@class,"card")][1]'
@@ -298,7 +324,6 @@ def _extract_class_context_for_table(page: Page, table: Locator) -> ClassContext
         pass
 
     if not header_text:
-        # last resort: the nearest preceding heading
         try:
             header = table.locator("xpath=preceding::h3[1] | preceding::h4[1]").first
             if header.is_visible():
@@ -306,22 +331,18 @@ def _extract_class_context_for_table(page: Page, table: Locator) -> ClassContext
         except Exception:
             pass
 
-    # Parse period/course/teacher with gentle regexes
     period = ""
     course = header_text.strip()
     teacher = ""
 
-    # Period like "Period 2" or "3A"
     m = re.search(r"Period\s*([0-9A-Za-z]+)", header_text, re.I)
     if m:
         period = m.group(1)
     else:
-        # Sometimes the first token is the period (e.g., "3A English 8 Honors (...)")
         m2 = re.match(r"^\s*([0-9A-Za-z]{1,3})\s+", header_text)
         if m2:
             period = m2.group(1)
 
-    # Teacher in parens like "(Smith)" or "Teacher: Smith"
     m = re.search(r"Teacher[:\s]*([A-Za-z .,'-]+)", header_text, re.I)
     if m:
         teacher = m.group(1).strip()
@@ -334,10 +355,8 @@ def _extract_class_context_for_table(page: Page, table: Locator) -> ClassContext
 
 
 def _parse_table_rows(page: Page, table: Locator, student: str) -> List[List[str]]:
-    """Parse one assignment table into sheet rows (list of lists)."""
     ctx = _extract_class_context_for_table(page, table)
 
-    # Identify header columns dynamically
     headers = []
     try:
         headers = [h.strip() for h in table.locator("thead tr th").all_inner_texts()]
@@ -365,12 +384,11 @@ def _parse_table_rows(page: Page, table: Locator, student: str) -> List[List[str
     i_comments = idx("Comments") or idx("Notes")
 
     rows_out: List[List[str]] = []
-
     for tr in table.locator("tbody tr").all():
         tds = [c.strip() for c in tr.locator("td").all_inner_texts()]
         if not tds:
             continue
-        if any("No Assignments Available" in x for x in tds):
+        if any("No Assignments" in x for x in tds):
             continue
 
         def pick(i: int | None) -> str:
@@ -398,19 +416,13 @@ def _parse_table_rows(page: Page, table: Locator, student: str) -> List[List[str
 
 
 def extract_assignments_for_student(page: Page, student: str) -> Tuple[List[List[str]], int]:
-    """
-    Switch to the student, wait for assignments, then parse all tables.
-    Returns (rows, table_count_seen).
-    """
     if not switch_to_student(page, student):
-        print(f"DEBUG — could not locate a picker for '{student}'; skipping switch")
         return [], 0
 
     if not ensure_assignments_ready(page):
         print("DEBUG — assignments view not ready; continuing")
         return [], 0
 
-    # Find all assignment tables
     tables = page.locator('table[id^="tblAssign_"]')
     ids = []
     try:
@@ -420,58 +432,50 @@ def extract_assignments_for_student(page: Page, student: str) -> Tuple[List[List
         pass
     if ids:
         print(f"DEBUG — found assignment tables (ids): {ids}")
-    else:
-        print("DEBUG — no assignment tables found (may be 'No Assignments Available')")
 
-    all_rows: List[List[str]] = []
+    rows: List[List[str]] = []
     for tbl in tables.all():
-        all_rows.extend(_parse_table_rows(page, tbl, student))
+        rows.extend(_parse_table_rows(page, tbl, student))
 
-    return all_rows, len(ids)
+    return rows, len(ids)
 
 
 # ------------------------------
 # Top-level runner used by main.py
 # ------------------------------
 def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[List[str]], Dict]:
-    """
-    Orchestrates browser, login and scraping for all students.
-    Returns (rows, metrics).
-    """
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
         context = browser.new_context()
+        context.set_default_timeout(20000)
         page = context.new_page()
 
-        # Always start at root login page
         _goto(page, LOGIN_URL, label="LOGIN_URL(start)")
         print(f"DEBUG — landed: {page.url}")
 
         ensure_logged_in_and_on_portal(page, username, password)
-        if "PortalMainPage" not in page.url:
-            # Nudge again (robust goto)
-            _goto(page, PORTAL_HOME, label="PORTAL_HOME(nudge)")
 
-        # Debug UI snapshot for triage
         print(f"DEBUG — UI SNAPSHOT — url: {page.url}")
-        print(f"DEBUG — UI SNAPSHOT — sample: {ui_snapshot(page)}")
+        sample = []
+        bt = " ".join(_body_text(page).split())
+        for token in ["Home", "FAQs", "District Website", "Terms of Use"]:
+            if token in bt:
+                sample.append(token)
+        print(f"DEBUG — UI SNAPSHOT — sample: {', '.join(sample) if sample else '(none)'}")
 
         all_rows: List[List[str]] = []
-        total_tables = 0
+        table_total = 0
 
         for s in students:
             stu_rows, tbl_count = extract_assignments_for_student(page, s)
-            total_tables += tbl_count
-            if stu_rows:
-                print(f"DEBUG — class tables for {s}: {tbl_count}")
-                all_rows.extend(stu_rows)
-            else:
-                print(f"DEBUG — class tables for {s}: 0")
+            print(f"DEBUG — class tables for {s}: {tbl_count}")
+            table_total += tbl_count
+            all_rows.extend(stu_rows)
 
         print(f"DEBUG — scraped {len(all_rows)} rows from portal")
 
         context.close()
         browser.close()
 
-        metrics = {"tables_seen": total_tables, "rows": len(all_rows)}
+        metrics = {"tables_seen": table_total, "rows": len(all_rows)}
         return all_rows, metrics
