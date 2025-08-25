@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import re
 from typing import List, Dict, Optional
+from datetime import datetime
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
 
 BASE_URL = "https://parentportal.cajonvalley.net/"
 
 
 # --------------------------
-# Small helpers
+# Tiny helpers
 # --------------------------
 
 def _visible(page, selector: str) -> bool:
@@ -20,97 +20,91 @@ def _visible(page, selector: str) -> bool:
         return False
 
 
-def _first_visible_selector(page, selectors: List[str]) -> Optional[str]:
-    for sel in selectors:
+def _first_visible(page, sels: List[str]) -> Optional[str]:
+    for s in sels:
+        if _visible(page, s):
+            return s
+    return None
+
+
+def _wait_one_of(page, sels: List[str], timeout_each: int = 3000) -> Optional[str]:
+    for s in sels:
         try:
-            if page.is_visible(sel):
-                return sel
+            page.wait_for_selector(s, state="visible", timeout=timeout_each)
+            return s
         except Exception:
             pass
     return None
 
 
-def _wait_for_one_of(page, selectors: List[str], timeout_each: int = 3000) -> Optional[str]:
-    """Try each selector in order; return the first that becomes visible."""
-    for sel in selectors:
-        try:
-            page.wait_for_selector(sel, state="visible", timeout=timeout_each)
-            return sel
-        except Exception:
-            continue
-    return None
-
-
-def _text(el) -> str:
+def _txt(el) -> str:
     try:
         return (el.inner_text() or "").strip()
     except Exception:
         return ""
 
 
-def _clean_space(s: str) -> str:
+def _clean(s: str) -> str:
     return " ".join((s or "").split())
 
 
+def _log_dom_probe(page, label: str) -> None:
+    try:
+        url = page.url
+    except Exception:
+        url = "(no url)"
+    try:
+        title = page.title()
+    except Exception:
+        title = "(no title)"
+    print(f"DEBUG — {label}: url={url} | title={title}")
+    # First ~300 chars of visible body text — helpful to see what page we’re on.
+    try:
+        sample = page.locator("body").inner_text(timeout=1000)
+        sample = _clean(sample)[:300]
+        print(f"DEBUG — {label}: body≈ \"{sample}\"")
+    except Exception:
+        pass
+
+
 # --------------------------
-# Navigation helpers
+# Navigation / login
 # --------------------------
 
 def goto_home(page) -> None:
-    """
-    Force navigation to the main portal page and wait for any known marker.
-    This handles cases where the landing page after login varies.
-    """
+    # Force main portal page
     page.goto(BASE_URL + "Home/PortalMainPage", wait_until="domcontentloaded")
-
-    page.wait_for_load_state("domcontentloaded")
     page.wait_for_load_state("networkidle")
+    _log_dom_probe(page, "after login nav")
 
+    # Accept a broader set of “I’m on the portal” markers
     portal_markers = [
-        "#SP1_Assignments",
-        "#SP_Assignments",
-        "#openSelect",
-        "#imgStudents",
-        ".studentTile",
+        "#SP_Assignments", "#SP1_Assignments",
+        "[id*='_Assignments']", "[id*='Assignments']",
+        "#openSelect", "#imgStudents", ".studentTile",
+        "#divSelectStudent", "#divStudentBanner"
     ]
-    seen = _wait_for_one_of(page, portal_markers, timeout_each=3000)
-    print("DEBUG — after login: portal loaded")
-    print(f"DEBUG — saw portal marker: {seen or 'None'}")
-    print(f"DEBUG — saw student tiles: {_visible(page, '.studentTile')}")
+    seen = _wait_one_of(page, portal_markers, timeout_each=2000)
+    print(f"DEBUG — portal marker seen: {seen or 'None'}")
 
 
 def login(page, username: str, password: str) -> None:
     page.goto(BASE_URL, wait_until="domcontentloaded")
     print(f"DEBUG — landed: {page.url}")
 
-    # Login variants
-    user_selectors = [
-        'input[name="username"]',
-        'input[name="UserName"]',
-        "#UserName",
-        "#username",
-    ]
-    pass_selectors = [
-        'input[name="password"]',
-        'input[name="Password"]',
-        "#Password",
-        "#password",
-    ]
-    submit_selectors = [
-        'input[type="submit"]',
-        'button[type="submit"]',
-        'button:has-text("Sign In")',
-        'input[value*="Sign In"]',
-    ]
+    user_sels = ['input[name="username"]', 'input[name="UserName"]', "#UserName", "#username"]
+    pass_sels = ['input[name="password"]', 'input[name="Password"]', "#Password", "#password"]
+    submit_sels = ['input[type="submit"]', 'button[type="submit"]',
+                   'button:has-text("Sign In")', 'input[value*="Sign In"]']
 
-    user_sel = _first_visible_selector(page, user_selectors)
-    pwd_sel  = _first_visible_selector(page, pass_selectors)
+    user_sel = _first_visible(page, user_sels)
+    pwd_sel  = _first_visible(page, pass_sels)
     print(f"DEBUG — login fields visible: {bool(user_sel and pwd_sel)}")
 
     if user_sel and pwd_sel:
         page.fill(user_sel, username)
         page.fill(pwd_sel, password)
-        sub_sel = _first_visible_selector(page, submit_selectors)
+        sub_sel = _first_visible(page, submit_sels)
         if sub_sel:
             page.click(sub_sel)
         else:
@@ -120,69 +114,74 @@ def login(page, username: str, password: str) -> None:
 
 
 # --------------------------
-# Student switching
+# Student helpers
 # --------------------------
 
-def open_student_picker(page) -> None:
-    # Try to open the picker (button/avatar)
-    for sel in ["#openSelect", "#imgStudents", "a:has-text('Students')", "button:has-text('Students')"]:
-        try:
-            if _visible(page, sel):
-                page.click(sel, timeout=2000)
+def _open_student_picker_if_any(page) -> None:
+    for s in ["#openSelect", "#imgStudents", "a:has-text('Students')", "button:has-text('Students')"]:
+        if _visible(page, s):
+            try:
+                page.click(s, timeout=1500)
                 break
-        except Exception:
-            pass
-
-    # Wait for the tile panel if that UI exists
+            except Exception:
+                pass
     try:
-        page.wait_for_selector("#divSelectStudent", state="visible", timeout=3000)
+        page.wait_for_selector("#divSelectStudent, .studentTile", timeout=2000)
     except Exception:
-        pass  # not all layouts use a tile panel
+        pass
 
 
-def try_select_from_dropdown(page, target_name: str) -> bool:
-    """
-    Fallback: some layouts provide a <select> for students instead of tiles.
-    Try each select and choose the option whose label contains the target_name.
-    """
+def _pick_from_dropdown(page, target: str) -> bool:
     try:
         selects = page.query_selector_all("select")
     except Exception:
         selects = []
-
     for sel in selects or []:
         try:
-            options = sel.query_selector_all("option")
-            labels = [(_text(o), o.get_attribute("value") or "") for o in options]
-            match = None
-            for lbl, val in labels:
-                if target_name.lower() in (lbl or "").lower():
-                    match = (lbl, val)
-                    break
-            if match:
-                label, value = match
-                # Prefer selecting by value; if empty, use label
-                if value:
-                    page.select_option(sel, value=value)
-                else:
-                    page.select_option(sel, label=label)
-                page.wait_for_load_state("networkidle")
-                _wait_for_one_of(page, ["#SP1_Assignments", "#SP_Assignments"], timeout_each=4000)
-                print(f"DEBUG — switched via dropdown to student {target_name}")
-                return True
+            opts = sel.query_selector_all("option")
+            for o in opts:
+                label = _txt(o)
+                if target.lower() in (label or "").lower():
+                    value = o.get_attribute("value") or ""
+                    if value:
+                        page.select_option(sel, value=value)
+                    else:
+                        page.select_option(sel, label=label)
+                    page.wait_for_load_state("networkidle")
+                    print(f"DEBUG — switched via dropdown to {target}")
+                    return True
         except Exception:
             continue
     return False
 
 
-def switch_to_student(page, nickname_or_name: str) -> bool:
-    """
-    Returns True if we believe we're now on the requested student.
-    Falls back gracefully if we can't find a picker.
-    """
-    open_student_picker(page)
+def _current_student_name(page) -> Optional[str]:
+    probes = [
+        "#divStudentBanner",
+        "#studentBanner",
+        "header:has-text('Student')",
+        "a#openSelect",
+        ".studentTile.selected",
+    ]
+    for p in probes:
+        try:
+            if page.is_visible(p):
+                txt = page.inner_text(p).strip()
+                # Heuristic: shortest “Name (ID…)” / “Name - …”
+                txt = _clean(txt)
+                if txt:
+                    # Keep just the first two words to avoid long banners
+                    parts = txt.split()
+                    if len(parts) >= 1:
+                        return " ".join(parts[:3])
+        except Exception:
+            pass
+    return None
 
-    # Tile-based UI
+
+def switch_to_student(page, target: str) -> bool:
+    _open_student_picker_if_any(page)
+
     tiles = page.locator(".studentTile")
     try:
         count = tiles.count()
@@ -190,31 +189,28 @@ def switch_to_student(page, nickname_or_name: str) -> bool:
         count = 0
 
     if count and count > 0:
-        # Exact text match tile first
-        tile = tiles.filter(has_text=nickname_or_name)
-        if tile.count() == 0:
-            # Fuzzy match
-            for i in range(count):
+        # Prefer exact-ish match, otherwise fuzzy contains
+        cand = tiles.filter(has_text=target)
+        if cand.count() == 0:
+            for i in range(min(count, 12)):  # don’t iterate endlessly
                 t = tiles.nth(i)
-                if nickname_or_name.lower() in _text(t).lower():
-                    tile = t
+                if target.lower() in _txt(t).lower():
+                    cand = t
                     break
-
-        # Click if we found one
         try:
-            (tile if hasattr(tile, "click") else tile.first).click()
+            (cand if hasattr(cand, "click") else cand.first).click()
             page.wait_for_load_state("domcontentloaded")
-            _wait_for_one_of(page, ["#SP1_Assignments", "#SP_Assignments"], timeout_each=4000)
-            print(f"DEBUG — switched to student {nickname_or_name}")
+            page.wait_for_load_state("networkidle")
+            print(f"DEBUG — switched to student {target} (tiles)")
             return True
         except Exception:
             pass
 
-    # Dropdown fallback
-    if try_select_from_dropdown(page, nickname_or_name):
+    if _pick_from_dropdown(page, target):
         return True
 
-    print(f"DEBUG — could not locate a picker for '{nickname_or_name}'; skipping this student")
+    # If we can't switch, we’ll continue with whatever student is active.
+    print(f"DEBUG — could not locate a picker for '{target}'; skipping switch")
     return False
 
 
@@ -222,45 +218,64 @@ def switch_to_student(page, nickname_or_name: str) -> bool:
 # Assignments extraction
 # --------------------------
 
+def _find_assignments_root(page) -> Optional[str]:
+    # Return the id of any Assignments container
+    try:
+        rid = page.eval_on_selector(
+            "#SP_Assignments, #SP1_Assignments, [id*='_Assignments'], [id*='Assignments']",
+            "el => el && el.id ? el.id : null"
+        )
+        return rid
+    except Exception:
+        return None
+
+
 def ensure_assignments_ready(page, timeout: int = 10000) -> None:
-    # Container exists
-    try:
-        page.wait_for_selector("#SP1_Assignments, #SP_Assignments", timeout=timeout)
-    except PWTimeout:
-        pass
+    rid = _find_assignments_root(page)
+    if not rid:
+        # Sometimes needs a small scroll bump or a short wait
+        try:
+            page.mouse.wheel(0, 400)
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+        rid = _find_assignments_root(page)
 
-    # Hidden marker first (fast path)
-    try:
-        page.wait_for_selector("#SP_Assignments >> input#tablecount", timeout=timeout)
-        return
-    except PWTimeout:
-        pass
+    if not rid:
+        # No container at all; maybe a blank dashboard or maintenance page.
+        raise PWTimeout("Assignments container not found")
 
-    # A visible table is fine
-    try:
-        page.wait_for_selector("#SP_Assignments table.tblassign", state="visible", timeout=timeout)
-        return
-    except PWTimeout:
-        pass
+    # “ready” if one of: hidden #tablecount, a visible table, or the no-assignments text
+    sel_hidden_marker = f"#{rid} >> input#tablecount"
+    sel_tbl_visible   = f"#{rid} table.tblassign, #{rid} table[id^='tblAssign_']"
 
-    # Or explicit "No Assignments Available"
+    for s in [sel_hidden_marker, sel_tbl_visible]:
+        try:
+            page.wait_for_selector(s, timeout=timeout)
+            return
+        except PWTimeout:
+            pass
+
     try:
-        page.wait_for_selector('text=No Assignments Available', timeout=timeout)
+        page.get_by_text("No Assignments Available", exact=False).wait_for(state="visible", timeout=timeout)
         return
-    except PWTimeout:
+    except Exception:
         pass
 
     raise PWTimeout("Assignments area did not become ready")
 
 
-def parse_period_and_course(caption_text: str) -> (str, str):
-    t = _clean_space(caption_text)
+def _parse_period_and_course(caption: str) -> (str, str):
+    t = _clean(caption)
     m = re.search(r"Per\s*:\s*([A-Za-z0-9]+)\s+(.*)$", t)
     if m:
         return m.group(1), m.group(2)
     if ":" in t:
         _, right = t.split(":", 1)
-        right = _clean_space(right)
+        right = _clean(right)
         parts = right.split(" ", 1)
         return (parts[0] if parts else ""), right
     return "", t
@@ -269,19 +284,20 @@ def parse_period_and_course(caption_text: str) -> (str, str):
 def extract_assignments_for_student(page, student_name: str) -> List[Dict[str, str]]:
     ensure_assignments_ready(page)
 
+    rid = _find_assignments_root(page) or "SP_Assignments"
     try:
-        marker = page.eval_on_selector("#SP_Assignments >> input#tablecount", "el => el.value")
-        print(f"DEBUG — tablecount marker: {marker}")
+        marker = page.eval_on_selector(f"#{rid} >> input#tablecount", "el => el && el.value ? el.value : ''")
+        print(f"DEBUG — tablecount marker: {marker or '(n/a)'}")
     except Exception:
-        print("DEBUG — tablecount marker: (not found)")
+        print("DEBUG — tablecount marker: (n/a)")
 
     table_ids = page.eval_on_selector_all(
-        '#SP_Assignments table[id^="tblAssign_"]',
+        f"#{rid} table[id^='tblAssign_']",
         "els => els.map(e => e.id)"
     ) or []
     print(f"DEBUG — found assignment tables (ids): {table_ids}")
 
-    out: List[Dict[str, str]] = []
+    rows: List[Dict[str, str]] = []
 
     for tid in table_ids:
         cap_sel = f"#{tid} caption"
@@ -291,18 +307,18 @@ def extract_assignments_for_student(page, student_name: str) -> List[Dict[str, s
         except Exception:
             pass
 
-        period, course_name = parse_period_and_course(caption)
+        period, course_name = _parse_period_and_course(caption)
 
         for r in page.query_selector_all(f"#{tid} tbody > tr"):
             tds = r.query_selector_all("td")
             if not tds:
                 continue
-            if len(tds) == 1 and "no assignments available" in _text(tds[0]).lower():
+            if len(tds) == 1 and "no assignments available" in _txt(tds[0]).lower():
                 continue
 
             def cell(i):
                 try:
-                    return _clean_space(_text(tds[i]))
+                    return _clean(_txt(tds[i]))
                 except Exception:
                     return ""
 
@@ -323,8 +339,8 @@ def extract_assignments_for_student(page, student_name: str) -> List[Dict[str, s
                 elif pts_possible and score and pts_possible == score:
                     status = "WIN"
 
-            out.append({
-                "ImportedAt": "",
+            rows.append({
+                "ImportedAt": "",  # filled in main
                 "Student": student_name,
                 "Period": period if not course_name else f"{period}  {course_name}",
                 "Course": assignment,
@@ -340,7 +356,7 @@ def extract_assignments_for_student(page, student_name: str) -> List[Dict[str, s
                 "SourceURL": "",
             })
 
-    return out
+    return rows
 
 
 # --------------------------
@@ -356,14 +372,25 @@ def run_scrape(username: str, password: str, students: List[str]) -> List[Dict[s
         login(page, username, password)
 
         all_rows: List[Dict[str, str]] = []
+        extracted_students: set[str] = set()
+
         for s in students:
-            ok = switch_to_student(page, s)
-            if not ok:
-                print(f"DEBUG — skipping extraction for '{s}' (could not switch)")
-                continue
-            rows = extract_assignments_for_student(page, s)
-            print(f"DEBUG — class tables for {s}: {len(rows)}")
-            all_rows.extend(rows)
+            switched = switch_to_student(page, s)
+
+            # Try to learn who is currently selected (even if switch failed)
+            curr = _current_student_name(page) or s
+            if switched:
+                extracted_students.add(curr)
+
+            # Attempt extraction anyway—if we truly aren’t on a student,
+            # ensure_assignments_ready will raise and we just skip.
+            try:
+                rows = extract_assignments_for_student(page, curr)
+                print(f"DEBUG — class tables for {curr}: {len(rows)}")
+                if rows:
+                    all_rows.extend(rows)
+            except Exception as e:
+                print(f"DEBUG — skipping extraction for '{s}' ({'could not switch' if not switched else str(e)})")
 
         browser.close()
         return all_rows
