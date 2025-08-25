@@ -1,55 +1,41 @@
 import os
-import json
-from scraper import run_scrape
+from datetime import datetime
+from scraper import run_scrape, append_to_sheet
 
-def parse_env_list(name, default=""):
-    raw = os.getenv(name, default)
-    if raw is None:
-        raw = ""
-    if isinstance(raw, (list, tuple)):
-        return [str(x).strip() for x in raw if str(x).strip()]
-    return [s.strip() for s in str(raw).split(",") if s.strip()]
-
-def append_to_sheet(rows):
-    """
-    Best-effort Google Sheets append.
-    Expects GOOGLE_CREDS_JSON and SPREADSHEET_ID to be set.
-    Appends to the first worksheet.
-    """
-    import gspread
-
-    creds_json = os.getenv("GOOGLE_CREDS_JSON", "")
-    spreadsheet_id = os.getenv("SPREADSHEET_ID", "")
-    if not rows or not creds_json or not spreadsheet_id:
-        return False
-
-    try:
-        creds = json.loads(creds_json)
-        gc = gspread.service_account_from_dict(creds)
-        sh = gc.open_by_key(spreadsheet_id)
-        ws = sh.get_worksheet(0) or sh.sheet1
-        ws.append_rows(rows, value_input_option="RAW")
-        return True
-    except Exception as e:
-        print(f"DEBUG – sheets append failed: {e}")
-        return False
 
 def main():
-    username = os.getenv("PORTAL_USER", "")
-    password = os.getenv("PORTAL_PASS", "")
-    students = parse_env_list("STUDENTS")
+    username = os.environ.get("PORTAL_USER", "")
+    password = os.environ.get("PORTAL_PASS", "")
+    students_csv = os.environ.get("STUDENTS", "")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+    google_creds_json = os.environ.get("GOOGLE_CREDS_JSON", "")
 
-    print(f"DEBUG – landed: https://parentportal.cajonvalley.net/")
+    if not username or not password:
+        raise SystemExit("Missing PORTAL_USER or PORTAL_PASS env vars.")
+    if not spreadsheet_id or not google_creds_json:
+        raise SystemExit("Missing SPREADSHEET_ID or GOOGLE_CREDS_JSON env vars.")
+    if not students_csv.strip():
+        raise SystemExit("Missing STUDENTS env var (comma-separated).")
+
+    students = [s.strip() for s in students_csv.split(",") if s.strip()]
+    print(f"DEBUG — students parsed: {students}")
+
     rows, metrics = run_scrape(username, password, students)
 
-    imported = 0
-    if rows:
-        ok = append_to_sheet(rows)
-        imported = len(rows) if ok else 0
+    print(f"DEBUG — collected rows: {len(rows)}")
+    if not rows:
+        print("Imported 0 rows. Missing/Low: 0. Wins: 0")
+        return
 
-    print(
-        f"Imported {imported} rows. Missing/Low: {metrics.get('flags',0)}. Wins: {metrics.get('wins',0)}"
+    # Append to Google Sheet (creates header row if needed)
+    appended = append_to_sheet(
+        spreadsheet_id=spreadsheet_id,
+        google_creds_json=google_creds_json,
+        rows=rows,
+        worksheet_title="Assignments"  # change if you prefer another tab name
     )
+    print(f"Imported {appended} rows. Missing/Low: {metrics.get('missing_low', 0)}. Wins: {metrics.get('wins', 0)}")
+
 
 if __name__ == "__main__":
     main()
