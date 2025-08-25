@@ -1,10 +1,9 @@
 import os
-import time
+import json
 from datetime import datetime
 from typing import List, Dict
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 from scraper import run_scrape
 
@@ -15,13 +14,47 @@ HEADERS = [
 
 def get_env(name: str, default: str = "") -> str:
     v = os.getenv(name, default)
-    if v is None:
-        v = default
-    return v
+    return v if v is not None else default
 
 def get_students_from_env() -> List[str]:
     raw = get_env("STUDENTS", "")
     return [s.strip() for s in raw.split(",") if s.strip()]
+
+def make_gspread_client():
+    """
+    Supports either:
+      - GOOGLE_CREDS_JSON = path to the service account JSON file, or
+      - GOOGLE_CREDS_JSON = the *contents* of that JSON (one-line secret).
+    """
+    creds_raw = get_env("GOOGLE_CREDS_JSON", "").strip()
+    if not creds_raw:
+        raise RuntimeError("GOOGLE_CREDS_JSON is not set")
+
+    if os.path.exists(creds_raw):
+        # Path to file
+        return gspread.service_account(filename=creds_raw)
+
+    # JSON contents
+    try:
+        info = json.loads(creds_raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("GOOGLE_CREDS_JSON is neither a valid path nor valid JSON") from e
+
+    return gspread.service_account_from_dict(info)
+
+def connect_sheet(spreadsheet_id: str):
+    gc = make_gspread_client()
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.sheet1
+
+    # Ensure header row (new gspread signature: update(range, values))
+    existing = ws.get_all_values()
+    if not existing:
+        ws.update("1:1", [HEADERS])
+    else:
+        # keep header refreshed in case of schema changes
+        ws.update("1:1", [HEADERS])
+    return ws
 
 def dedup_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     seen = set()
@@ -39,38 +72,16 @@ def dedup_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
         out.append(r)
     return out
 
-def connect_sheet(spreadsheet_id: str):
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds_json = get_env("GOOGLE_CREDS_JSON")
-    creds = ServiceAccountCredentials.from_json_keyfile_name(creds_json, scope)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.sheet1
-
-    # Ensure header row (and fix deprecation warning: values first, then range_name)
-    existing = ws.get_all_values()
-    if not existing:
-        ws.update(values=[HEADERS], range_name="1:1")
-    else:
-        # keep header refreshed in case of changes
-        ws.update(values=[HEADERS], range_name="1:1")
-    return ws
-
 def append_rows(ws, rows: List[Dict[str, str]]):
     if not rows:
         return 0
-
-    # Timestamp
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     for r in rows:
         r["ImportedAt"] = now
 
-    # Build 2D values in header order
     values = [[r.get(h, "") for h in HEADERS] for r in rows]
-    start_row = len(ws.get_all_values()) + 1
-    end_row = start_row + len(values) - 1
-    rng = f"{start_row}:{end_row}"
-    ws.update(values=values, range_name=rng)
+    # Modern append API; avoids range math and deprecation warnings
+    ws.append_rows(values, value_input_option="RAW")
     return len(values)
 
 def main():
@@ -82,16 +93,13 @@ def main():
 
     ws = connect_sheet(spreadsheet_id)
 
-    # Scrape
     rows = run_scrape(username, password, students)
     print(f"DEBUG — scraped {len(rows)} rows from portal")
 
-    # Dedup within this run
     before = len(rows)
     rows = dedup_rows(rows)
     removed = before - len(rows)
 
-    # Append
     added = append_rows(ws, rows)
     print(f"Imported {added} new rows. Skipped as duplicates (before append): {removed}. Removed legacy dups during cleanup: 0.")
 
