@@ -21,10 +21,10 @@ def _first(el, selector):
 def login_and_wait(page, username, password):
     page.goto(PORTAL_URL, wait_until="domcontentloaded")
     pin = page.locator("#Pin")
-    pw = page.locator("#Password")
+    pw  = page.locator("#Password")
 
     pin_visible = pin.is_visible(timeout=10000)
-    pw_visible = pw.is_visible(timeout=10000)
+    pw_visible  = pw.is_visible(timeout=10000)
     print(f"DEBUG – login fields visible: {pin_visible} {pw_visible}")
 
     pin.fill(username)
@@ -49,21 +49,17 @@ def build_student_tile_map(page):
     ok = show_student_tiles(page)
     print(f"DEBUG – saw student tiles: {ok}")
     mapping = {}
-
     if not ok:
         return mapping
 
     tiles = page.query_selector_all(".studentTile")
     for t in tiles:
         tile_id_full = t.get_attribute("id") or ""   # e.g. stuTile_357342
-        tile_id_num = tile_id_full.split("_")[-1]
+        tile_id_num  = tile_id_full.split("_")[-1]
         nick_el = t.query_selector(".tileStudentNickname")
         nickname = (_text(nick_el)).lower()
         if nickname:
-            mapping[nickname] = {
-                "tile_id": tile_id_num,
-                "selector": f"#{tile_id_full}"
-            }
+            mapping[nickname] = {"tile_id": tile_id_num, "selector": f"#{tile_id_full}"}
     return mapping
 
 def current_student_banner_id(page):
@@ -106,32 +102,30 @@ def switch_to_student(page, nickname, tile_map):
 
 def ensure_assignments_ready(page):
     """
-    Open the Assignments area and wait until tables (or the tablecount marker)
-    are present. Returns True if something assignment-related is found.
+    Open the Assignments area and wait for either a tablecount marker
+    or any assignment table to appear.
     """
-    # Make sure the left-menu row is present
+    # Ensure the menu row exists; click to focus/open
     menu_row = page.locator("tr#Assignments")
-    if menu_row.count() == 0:
-        return False
+    if menu_row.count():
+        try:
+            menu_row.click()
+        except Exception:
+            pass
 
-    # Click once to ensure it's selected/expanded
+    # Make sure the content area exists
     try:
-        menu_row.click()
-    except Exception:
-        pass
-
-    # The content root/area
-    try:
-        page.wait_for_selector("#trSP1_Assignments, #SP_Assignments", timeout=8000)
+        page.wait_for_selector("#trSP1_Assignments, #SP_Assignments", timeout=10000)
     except PWTimeout:
         return False
 
-    # Wait for either the hidden count or any assignment table or the empty state
+    # IMPORTANT: do NOT mix `text=` engine with CSS in a single selector.
+    # Wait for either the hidden count or any table within Assignments.
     try:
-        page.wait_for_selector("input#tablecount, #SP_Assignments table.tblassign, table.tblassign, text=No Assignments Available", timeout=10000)
+        page.locator("input#tablecount, #SP_Assignments table.tblassign, table.tblassign").first.wait_for(timeout=10000)
     except PWTimeout:
-        # As a last nudge, small wait and continue
-        page.wait_for_timeout(500)
+        # Small grace period; some pages are just slow to render the rows.
+        page.wait_for_timeout(750)
 
     # Log tablecount if present
     tablecount_val = "?"
@@ -141,8 +135,8 @@ def ensure_assignments_ready(page):
         pass
     print(f"DEBUG – tablecount marker: {tablecount_val}")
 
-    # Small wait to allow rendering
-    page.wait_for_timeout(300)
+    # Give layout a beat
+    page.wait_for_timeout(250)
     return True
 
 def collect_assignment_tables(page):
@@ -167,10 +161,7 @@ def collect_assignment_tables(page):
         except Exception:
             pass
 
-    # Debug: list ids we found
-    ids = []
-    for el in tables:
-        ids.append(el.get_attribute("id") or "(no id)")
+    ids = [el.get_attribute("id") or "(no id)" for el in tables]
     print(f"DEBUG – found assignment tables (ids): {ids}")
     return tables
 
@@ -180,7 +171,7 @@ def extract_assignments_for_student(page, student_name):
     """
     Returns (rows, counts)
       rows: [timestamp, student, course, assignment, due_date, pct, status]
-      counts: dict with 'flags' (missing+low) and 'wins'
+      counts: {'flags': missing+low, 'wins': high}
     """
     ok = ensure_assignments_ready(page)
     if not ok:
@@ -268,7 +259,6 @@ def run_scrape(username, password, students):
         page.set_default_timeout(15000)
 
         login_and_wait(page, username, password)
-
         tile_map = build_student_tile_map(page)
 
         for s in students:
