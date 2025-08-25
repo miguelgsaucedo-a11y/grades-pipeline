@@ -1,66 +1,60 @@
 import os
 import json
 import datetime as dt
-from typing import List, Tuple
+from typing import List
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 from scraper import run_scrape
 
-HEADERS = ["ImportedAt","Student","Period","Course","Teacher","DueDate","AssignedDate",
-           "Assignment","PtsPossible","Score","Pct","Status","Comments","SourceURL"]
+HEADERS = [
+    "ImportedAt","Student","Period","Course","Teacher","DueDate","AssignedDate",
+    "Assignment","PtsPossible","Score","Pct","Status","Comments","SourceURL"
+]
 
 def _now_ts() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def _mk_key(row: List[str]) -> str:
     # Stable de-dup key by student/course/assignment/duedate
-    # row layout follows OUR_COLS in scraper.py
     (student, period, course, teacher, due, assigned, asg, pts, score, pct, status, comments, url) = row
     return "||".join([
         student.strip().lower(),
         course.strip().lower(),
         asg.strip().lower(),
-        due.strip().lower()
+        due.strip().lower(),
     ])
 
-def _open_sheet() -> gspread.Worksheet:
+def _open_sheet():
+    """Authorize with Google using gspread's google-auth and return the worksheet."""
     creds_json = os.environ.get("GOOGLE_CREDS_JSON", "")
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
+
+    # Accept either a JSON string or a path to the JSON file
     if creds_json.strip().startswith("{"):
         creds_dict = json.loads(creds_json)
+        gc = gspread.service_account_from_dict(creds_dict)
     else:
-        # path in env var
-        with open(creds_json, "r") as f:
-            creds_dict = json.load(f)
+        gc = gspread.service_account(filename=creds_json)
 
-    scope = ["https://spreadsheets.google.com/feeds",
-             "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    gc = gspread.authorize(creds)
     sh = gc.open_by_key(spreadsheet_id)
     try:
         ws = sh.worksheet("Assignments")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="Assignments", rows="2", cols=str(len(HEADERS)))
-    # ensure headers
-    ws.update([HEADERS], "A1")
+
+    # Ensure headers (use named args to avoid deprecation warnings)
+    ws.update(range_name="A1", values=[HEADERS])
     return ws
 
 def append_rows_dedup(ws, scraped: List[List[str]]):
-    # fetch existing for de-dup
+    # Build a set of existing keys to avoid duplicates
     existing = ws.get_all_values()
     existing_keys = set()
     if len(existing) > 1:
-        header = existing[0]
         rows = existing[1:]
-        # current sheet columns match HEADERS, data rows we add prepend ImportedAt
-        # so rows[i][1:] aligns to OUR_COLS
         for r in rows:
             if len(r) >= len(HEADERS):
-                # strip ImportedAt when computing key
-                key = _mk_key(r[1:1+13])
-                existing_keys.add(key)
+                existing_keys.add(_mk_key(r[1:1+13]))  # ignore ImportedAt
 
     new_rows = []
     for r in scraped:
@@ -69,7 +63,11 @@ def append_rows_dedup(ws, scraped: List[List[str]]):
 
     if new_rows:
         ws.append_rows(new_rows, value_input_option="RAW")
-    print(f"Imported {len(new_rows)} new rows. Skipped as duplicates (before append): {len(scraped)-len(new_rows)}. Removed legacy dups during cleanup: 0.")
+    print(
+        f"Imported {len(new_rows)} new rows. "
+        f"Skipped as duplicates (before append): {len(scraped) - len(new_rows)}. "
+        f"Removed legacy dups during cleanup: 0."
+    )
 
 def main():
     username = os.environ["PORTAL_USER"]
@@ -82,8 +80,7 @@ def main():
     print(f"DEBUG — scraped {len(rows)} rows from portal")
 
     ws = _open_sheet()
-    # ensure headers again (API changed warnings otherwise)
-    ws.update([HEADERS], "A1")
+    ws.update(range_name="A1", values=[HEADERS])  # re-ensure
     append_rows_dedup(ws, rows)
 
 if __name__ == "__main__":
