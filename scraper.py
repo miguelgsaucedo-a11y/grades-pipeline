@@ -1,22 +1,20 @@
 # scraper.py
 from __future__ import annotations
-
 import re
 import time
 from typing import Dict, Iterable, List, Tuple
-
 from playwright.sync_api import Playwright, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 PORTAL_BASE = "https://parentportal.cajonvalley.net"
 PORTAL_HOME = f"{PORTAL_BASE}/Home/PortalMainPage"
-LOGON_URL = f"{PORTAL_BASE}/Account/LogOn?ReturnUrl=%2FHome%2FPortalMainPage"
-LOGOFF_URL = f"{PORTAL_BASE}/Account/LogOff"
+LOGON_PATHS = [
+    "/Account/LogOn",   # primary
+    "/Account/Login",   # common alternate on some ASP.NET templates
+]
 
 def dbg(msg: str) -> None:
     print(f"DEBUG — {msg}")
-
-# ---------------------- small helpers ----------------------
 
 def _trim(s: str, n: int = 280) -> str:
     s = (s or "").strip().replace("\n", " ")
@@ -28,14 +26,14 @@ def _body_text(page, timeout=1500) -> str:
     except Exception:
         return ""
 
-def _wait_for_any_login_fields(page, timeout_ms=8000) -> bool:
+def _wait_login_fields(page, timeout_ms=8000) -> bool:
     user_candidates = [
         "#UserName", "input[name=UserName]",
-        "input[id*=User i][type=text]", "input[type=text][name*=user i]"
+        'input[type="text"][name*=ser i]', 'input[id*=User i]'
     ]
     pw_candidates = [
         "#Password", "input[name=Password]",
-        "input[type=password]", "input[id*=pass i]", "input[name*=pass i]"
+        'input[type="password"]', 'input[id*=ass i]'
     ]
     try:
         page.wait_for_selector(" , ".join(user_candidates), timeout=timeout_ms)
@@ -44,12 +42,10 @@ def _wait_for_any_login_fields(page, timeout_ms=8000) -> bool:
     except PlaywrightTimeoutError:
         return False
 
-def _dismiss_timeout_if_present(page) -> bool:
-    """Handle 'Your Session Has Timed Out … Click OK to Continue'."""
+def _dismiss_timeout(page) -> None:
     body = _body_text(page)
     if "Session Has Timed Out" not in body and "OK to Continue" not in body:
-        return False
-
+        return
     for sel in [
         'button:has-text("OK")',
         'text="OK to Continue"',
@@ -63,103 +59,114 @@ def _dismiss_timeout_if_present(page) -> bool:
             el = page.locator(sel).first
             if el and el.is_visible():
                 el.click()
-                page.wait_for_timeout(300)
+                page.wait_for_timeout(250)
                 break
         except Exception:
             pass
-
-    # Some pages use a JS dialog
     try:
         page.once("dialog", lambda d: d.accept())
     except Exception:
         pass
 
-    return True
-
-def _force_to_login(page) -> bool:
-    """
-    Aggressively steer to the real /Account/LogOn page.
-    Returns True if login fields become visible.
-    """
-    for attempt in range(4):
-        bust = int(time.time() * 1000)
+def _click_any_login_link(page) -> bool:
+    selectors = [
+        'a[href*="/Account/LogOn"]',
+        'a[href*="/Account/Login"]',
+        'a:has-text("Log On")',
+        'a:has-text("Log In")',
+        'a:has-text("Sign In")',
+        'button:has-text("Log On")',
+        'button:has-text("Log In")',
+        'button:has-text("Sign In")',
+    ]
+    for sel in selectors:
         try:
-            page.goto(f"{LOGOFF_URL}?_={bust}", wait_until="domcontentloaded")
-            page.wait_for_timeout(250)
+            el = page.locator(sel).first
+            if el and el.is_visible():
+                el.click()
+                page.wait_for_timeout(400)
+                return True
+        except Exception:
+            pass
+    return False
+
+def _navigate_to_login(page) -> bool:
+    """
+    Be very gentle with the portal:
+      1) go to site root (gives a referer + sets base cookies)
+      2) try clicking a Log On / Login link
+      3) try direct GET to /Account/LogOn (or /Login) only if needed
+      4) if server returns Error.htm, retreat to root and retry alternate path
+    """
+    for attempt in range(3):
+        try:
+            page.goto(PORTAL_BASE + "/", wait_until="domcontentloaded")
         except Exception:
             pass
 
-        # Try direct navigation to logon
-        try:
-            page.goto(f"{LOGON_URL}&_={bust}", wait_until="domcontentloaded")
-        except Exception:
-            pass
+        _dismiss_timeout(page)
 
-        # If we hit the timeout interstitial on /Home, clear it and try again
-        _dismiss_timeout_if_present(page)
+        # Try clicking a visible "Log On / Sign In" entry first
+        if _click_any_login_link(page):
+            if _wait_login_fields(page, timeout_ms=6000):
+                return True
 
-        if _wait_for_any_login_fields(page, timeout_ms=5000):
-            return True
-
-        # If still not on the form, try clicking any visible "Log On / Sign In" link
-        for sel in [
-            'a[href*="/Account/LogOn"]',
-            'a:has-text("Log On")',
-            'a:has-text("Log In")',
-            'a:has-text("Sign In")',
-            'button:has-text("Log On")',
-            'button:has-text("Log In")',
-            'button:has-text("Sign In")',
-        ]:
+        # Fall back to direct paths (with referer set by step above)
+        for path in LOGON_PATHS:
             try:
-                el = page.locator(sel).first
-                if el and el.is_visible():
-                    el.click()
-                    page.wait_for_timeout(400)
-                    if _wait_for_any_login_fields(page, timeout_ms=4000):
-                        return True
+                bust = int(time.time() * 1000)
+                page.goto(f"{PORTAL_BASE}{path}?_={bust}", wait_until="domcontentloaded")
             except Exception:
                 pass
 
-        # As a last nudge, tell the browser to set location via JS (bypasses some client scripts)
+            # If we landed on an ASP.NET Error page, back out and try the next path
+            if "/Error.htm" in page.url or "An error occurred while processing your request" in _body_text(page):
+                dbg(f"login DEBUG — got error page when requesting {path}; backing out")
+                try:
+                    page.goto(PORTAL_BASE + "/", wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                continue
+
+            if _wait_login_fields(page, timeout_ms=6000):
+                return True
+
+        # As a nudge, ask the browser to set location via JS from the root page
         try:
-            page.evaluate("location.href = arguments[0]", f"{LOGON_URL}&__={bust}")
-            page.wait_for_timeout(500)
+            page.goto(PORTAL_BASE + "/", wait_until="domcontentloaded")
+            page.evaluate("location.href = '/Account/LogOn'")
+            page.wait_for_timeout(600)
+            if _wait_login_fields(page, timeout_ms=6000):
+                return True
         except Exception:
             pass
 
-    # If we reach here, we couldn't surface the login fields
+    # Diagnostics to help us adapt quickly
     dbg(f"login DEBUG — url now: {page.url}")
     dbg(f"login DEBUG — body: {_trim(_body_text(page), 240)}")
     return False
 
-# ---------------------- login / switch / scrape ----------------------
-
 def login(page, username: str, password: str) -> None:
-    # Start from home (what you already do), then force to login page
-    try:
-        page.goto(PORTAL_HOME, wait_until="domcontentloaded")
-    except Exception:
-        pass
-
-    visible = _force_to_login(page)
+    visible = _navigate_to_login(page)
     dbg(f"login fields visible: {visible}")
     if not visible:
         raise RuntimeError("Login form not found — cannot proceed.")
 
     # Fill username
-    for sel in ["#UserName", "input[name=UserName]", "input[type=text][name*=user i]", "input[id*=User i]"]:
+    for sel in ["#UserName", "input[name=UserName]", 'input[type="text"][name*=ser i]', 'input[id*=User i]']:
         try:
-            if page.locator(sel).first.is_visible():
+            el = page.locator(sel).first
+            if el and el.is_visible():
                 page.fill(sel, username)
                 break
         except Exception:
             pass
 
     # Fill password
-    for sel in ["#Password", "input[name=Password]", "input[type=password]", "input[id*=pass i]"]:
+    for sel in ["#Password", "input[name=Password]", 'input[type="password"]', 'input[id*=ass i]']:
         try:
-            if page.locator(sel).first.is_visible():
+            el = page.locator(sel).first
+            if el and el.is_visible():
                 page.fill(sel, password)
                 break
         except Exception:
@@ -203,7 +210,6 @@ def login(page, username: str, password: str) -> None:
             except Exception:
                 pass
         time.sleep(0.3)
-
     dbg("after login: portal loaded")
 
 def _casefold(s: str) -> str:
@@ -363,7 +369,6 @@ def extract_assignments_for_student(page, student: str) -> Tuple[List[List[str]]
     rows: List[List[str]] = []
     tables = page.locator('table[id^="tblAssign_"]')
 
-    # log table IDs to help debugging different pages
     try:
         ids = []
         for i in range(tables.count()):
@@ -408,12 +413,25 @@ def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+        ctx = browser.new_context(
+            viewport={"width": 1366, "height": 900},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"),
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
         page = ctx.new_page()
 
-        page.goto(PORTAL_HOME, wait_until="domcontentloaded")
+        # land on HOME first (this is mostly for logging)
+        try:
+            page.goto(PORTAL_HOME, wait_until="domcontentloaded")
+        except Exception:
+            pass
         dbg(f"landed: {page.url}")
 
+        # login
         login(page, username, password)
 
         for s in students:
