@@ -1,59 +1,37 @@
-# scraper.py
 from __future__ import annotations
-import re
-import time
+import re, time
 from typing import Dict, Iterable, List, Tuple
 from playwright.sync_api import Playwright, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-PORTAL_BASE = "https://parentportal.cajonvalley.net"
-PORTAL_HOME = f"{PORTAL_BASE}/Home/PortalMainPage"
+PORTAL_BASE  = "https://parentportal.cajonvalley.net"
+PORTAL_HOME  = f"{PORTAL_BASE}/Home/PortalMainPage"
 
-LOGON_PATHS = [
-    "/",
-    "/Account/LogOn",
-    "/Account/Login",
-    "/Account/LogOn?ReturnUrl=%2FHome%2FPortalMainPage",
-    "/Account/Login?ReturnUrl=%2FHome%2FPortalMainPage",
-]
-
-def dbg(msg: str) -> None:
-    print(f"DEBUG — {msg}")
-
-def _trim(s: str, n: int = 260) -> str:
+def dbg(s: str): print(f"DEBUG — {s}")
+def _trim(s: str, n: int = 160) -> str:
     s = (s or "").strip().replace("\n", " ")
     return s[:n] + ("…" if len(s) > n else "")
 
-# -------------------- frame helpers --------------------
-
+# ---------- frame helpers ----------
 def _all_frames(page):
-    seen = set()
     out = []
     try:
-        mf = page.main_frame
-        if mf:
-            seen.add(id(mf))
-            out.append(mf)
-    except Exception:
-        pass
+        if page.main_frame: out.append(page.main_frame)
+    except Exception: pass
     try:
         for fr in page.frames:
-            if id(fr) not in seen:
-                out.append(fr)
-    except Exception:
-        pass
+            if fr not in out: out.append(fr)
+    except Exception: pass
     return out
 
-def _body_text_any(page, timeout=1000) -> str:
+def _body_text_any(page, timeout=900) -> str:
     parts = []
     for fr in _all_frames(page):
         try:
             t = fr.locator("body").inner_text(timeout=timeout)
-            if t:
-                parts.append(_trim(t, 180))
-        except Exception:
-            pass
-    return " | ".join(parts)[:800]
+            if t: parts.append(_trim(t, 220))
+        except Exception: pass
+    return " | ".join(parts)[:1200]
 
 def _first_visible(page, selector: str):
     for fr in _all_frames(page):
@@ -61,10 +39,8 @@ def _first_visible(page, selector: str):
             loc = fr.locator(selector)
             if loc.count() > 0:
                 el = loc.first
-                if el.is_visible():
-                    return fr, el
-        except Exception:
-            pass
+                if el.is_visible(): return fr, el
+        except Exception: pass
     return None, None
 
 def _click_if_visible(page, selector: str) -> bool:
@@ -72,481 +48,350 @@ def _click_if_visible(page, selector: str) -> bool:
     if fr and el:
         try:
             el.click()
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(200)
             return True
         except Exception:
             return False
     return False
 
-# -------------------- login flows --------------------
+# ---------- login ----------
+LOGON_PATHS = ["/Account/LogOn", "/Account/Login"]
+USER_SELECTORS = ["#UserName", "input[name=UserName]", 'input[id*="user" i]', 'input[type="text"]']
+PIN_LIKE     = ['input[id*="PIN"]','input[name="PIN"]','input[placeholder*="PIN" i]']
+PASS_SELECTORS = ["#Password","input[name=Password]",'input[type="password"]','input[id*="pass" i]']
+SUBMIT_SELECTORS = ['button[type=submit]','input[type=submit]','button:has-text("Login")','button:has-text("Log On")','input[type=button][value="Login"]']
 
-def _dismiss_timeout_any(page) -> None:
+def _dismiss_timeout_any(page):
     txt = _body_text_any(page)
     if ("Session Has Timed Out" not in txt) and ("OK to Continue" not in txt):
         return
-    for sel in [
-        'button:has-text("OK")', 'input[type=button][value="OK"]',
-        'a:has-text("OK")', 'button:has-text("Continue")', 'a:has-text("Continue")',
-    ]:
+    for sel in ['button:has-text("OK")','a:has-text("OK")','button:has-text("Continue")']:
         if _click_if_visible(page, sel):
             dbg("login DEBUG — dismissed timeout dialog")
-            page.wait_for_timeout(350)
-            break
-    try:
-        page.once("dialog", lambda d: d.accept())
-    except Exception:
-        pass
+            page.wait_for_timeout(300); break
+    try: page.once("dialog", lambda d: d.accept())
+    except Exception: pass
 
-PIN_SELECTORS = [
-    "#PIN", "input[name=PIN]", 'input[id*="PIN"]', 'input[placeholder*="PIN" i]', 'input[aria-label*="PIN" i]',
-]
-USER_SELECTORS = [
-    "#UserName", "input[name=UserName]", 'input[name="username" i]', 'input[id*="user" i]',
-] + PIN_SELECTORS
-PASS_SELECTORS = [
-    "#Password", "input[name=Password]", 'input[id*="pass" i]', 'input[type="password"]',
-    'input[placeholder*="password" i]', 'input[aria-label*="password" i]',
-]
-SUBMIT_SELECTORS = [
-    'button[type=submit]', 'input[type=submit]',
-    'button:has-text("Log On")', 'button:has-text("Login")', 'button:has-text("Sign In")',
-    'input[type=button][value="Log On"]', 'input[type=button][value="Login"]',
-    'a:has-text("Log On")', 'a:has-text("Login")', 'a:has-text("Sign In")',
-]
-
-def _wait_login_fields_any(page, timeout_ms=8000) -> Tuple[bool, object, str, str]:
-    deadline = time.time() + timeout_ms / 1000.0
+def _wait_login_fields_any(page, timeout_ms=9000):
+    deadline = time.time() + timeout_ms/1000
     while time.time() < deadline:
         for fr in _all_frames(page):
-            u_sel, p_sel = "", ""
-            # username / PIN
-            for us in USER_SELECTORS:
+            u=p=""
+            for sel in USER_SELECTORS + PIN_LIKE:
                 try:
-                    if fr.locator(us).first.is_visible():
-                        u_sel = us; break
+                    if fr.locator(sel).first.is_visible(): u = sel; break
                 except Exception: pass
-            if not u_sel:
+            for sel in PASS_SELECTORS:
                 try:
-                    if fr.get_by_label(re.compile(r"\bPIN\b", re.I)).is_visible():
-                        u_sel = "LABEL::PIN"
+                    if fr.locator(sel).first.is_visible(): p = sel; break
                 except Exception: pass
-            # password
-            for ps in PASS_SELECTORS:
-                try:
-                    if fr.locator(ps).first.is_visible():
-                        p_sel = ps; break
-                except Exception: pass
-            if not p_sel:
-                try:
-                    if fr.get_by_label(re.compile(r"password", re.I)).is_visible():
-                        p_sel = "LABEL::PASSWORD"
-                except Exception: pass
-            if u_sel and p_sel:
-                return True, fr, u_sel, p_sel
+            if u and p: return True, fr, u, p
         page.wait_for_timeout(120)
     return False, None, "", ""
 
-def _navigate_to_login(page) -> Tuple[bool, object, str, str]:
+def _navigate_to_login(page):
     for _ in range(4):
-        try:
-            page.goto(PORTAL_HOME, wait_until="domcontentloaded")
-        except Exception:
-            pass
+        try: page.goto(PORTAL_HOME, wait_until="domcontentloaded")
+        except Exception: pass
         _dismiss_timeout_any(page)
-
-        for sel in [
-            'a:has-text("ParentPortal Login")', 'a:has-text("Parent Portal Login")',
-            'a:has-text("Log On")', 'a:has-text("Login")', 'a:has-text("Sign In")',
-            'button:has-text("ParentPortal Login")', 'button:has-text("Login")', 'button:has-text("Sign In")',
-        ]:
-            if _click_if_visible(page, sel):
-                ok, fr, us, ps = _wait_login_fields_any(page, timeout_ms=6000)
-                if ok: return True, fr, us, ps
-
-        for path in LOGON_PATHS:
-            url = f"{PORTAL_BASE}{path}" if path.startswith("/") else f"{PORTAL_BASE}/{path}"
+        for path in LOGON_PATHS + ["/"]:
             try:
-                page.goto(url, wait_until="domcontentloaded")
-            except Exception:
-                pass
-
-            if "/Error.htm" in page.url or "An error occurred while processing your request" in _body_text_any(page):
-                dbg(f"login DEBUG — got error page when requesting {path}; backing out")
-                try: page.goto(f"{PORTAL_BASE}/Account/LogOff", wait_until="domcontentloaded")
-                except Exception: pass
-                try: page.goto(PORTAL_HOME, wait_until="domcontentloaded")
-                except Exception: pass
-                _dismiss_timeout_any(page)
-                continue
-
-            for sel in ['a:has-text("ParentPortal Login")','button:has-text("ParentPortal Login")',
-                        'a:has-text("Parent Portal Login")','button:has-text("Parent Portal Login")']:
-                _click_if_visible(page, sel)
-
-            ok, fr, us, ps = _wait_login_fields_any(page, timeout_ms=6000)
+                page.goto(PORTAL_BASE + path, wait_until="domcontentloaded")
+            except Exception: pass
+            _dismiss_timeout_any(page)
+            ok, fr, us, ps = _wait_login_fields_any(page)
             if ok: return True, fr, us, ps
-
-        page.wait_for_timeout(400)
-
+        # try obvious entrypoints
+        for sel in ['a:has-text("ParentPortal Login")','button:has-text("ParentPortal Login")',
+                    'a:has-text("Login")','button:has-text("Login")','a:has-text("Sign In")']:
+            if _click_if_visible(page, sel):
+                ok, fr, us, ps = _wait_login_fields_any(page)
+                if ok: return True, fr, us, ps
     dbg(f"login DEBUG — url now: {page.url}")
     dbg(f"login DEBUG — body≈ {_trim(_body_text_any(page))}")
     return False, None, "", ""
 
-def login(page, username: str, password: str) -> None:
-    found, fr, user_sel, pass_sel = _navigate_to_login(page)
-    dbg(f"login fields visible: {found}")
-    if not found:
-        raise RuntimeError("Login form not found — cannot proceed.")
+def login(page, username: str, password: str):
+    ok, fr, us, ps = _navigate_to_login(page)
+    dbg(f"login fields visible: {ok}")
+    if not ok: raise RuntimeError("Login form not found — cannot proceed.")
+    tgt = fr or page
 
-    target = fr or page
+    def _fill(sel, val):
+        try: tgt.locator(sel).first.fill(val); return True
+        except Exception: return False
 
-    def _fill(sel: str, val: str):
-        try:
-            if sel == "LABEL::PIN":
-                target.get_by_label(re.compile(r"\bPIN\b", re.I)).fill(val); return True
-            if sel == "LABEL::PASSWORD":
-                target.get_by_label(re.compile(r"password", re.I)).fill(val); return True
-            target.fill(sel, val); return True
-        except Exception:
-            return False
-
-    if not _fill(user_sel, username):
-        for sel in ['input[type="text"]','input[type="tel"]','input[type="number"]','input:not([type])']:
-            try:
-                loc = target.locator(sel).first
-                if loc and loc.is_visible(): loc.fill(username); break
+    if not _fill(us, username):
+        for sel in ['input[type="text"]','input:not([type])','input[type="tel"]']:
+            try: tgt.locator(sel).first.fill(username); break
             except Exception: pass
-
-    if not _fill(pass_sel, password):
-        try: target.locator('input[type="password"]').first.fill(password)
+    if not _fill(ps, password):
+        try: tgt.locator('input[type="password"]').first.fill(password)
         except Exception: pass
 
-    if not any(_click_if_visible(target, sel) for sel in SUBMIT_SELECTORS):
-        try: target.keyboard.press("Enter")
+    done = False
+    for sel in SUBMIT_SELECTORS:
+        if _click_if_visible(tgt, sel): done = True; break
+    if not done:
+        try: tgt.keyboard.press("Enter")
         except Exception: pass
 
+    # wait until portal/home or banner exists
     deadline = time.time() + 20
     while time.time() < deadline:
         try: page.wait_for_load_state("domcontentloaded", timeout=1000)
         except Exception: pass
-        if page.url.startswith(PORTAL_HOME) or re.search(r"/Home/PortalMainPage", page.url, re.I):
-            break
-        for sel in ["#divStudentBanner", "#dvStudentBanner", "#divStudentInfo"]:
+        if "/Home/PortalMainPage" in page.url: break
+        for bsel in ["#divStudentBanner","#dvStudentBanner",".student-name",".studentBanner"]:
             try:
-                if page.locator(sel).first.is_visible(): return
+                if page.locator(bsel).first.is_visible(): break
             except Exception: pass
         _dismiss_timeout_any(page)
-        time.sleep(0.25)
+        time.sleep(0.2)
     dbg("after login: portal loaded")
 
-# -------------------- student UI discovery --------------------
-
-def _casefold(s: str) -> str:
-    return (s or "").casefold()
-
+# ---------- UI snapshot & switching ----------
 def _banner_text(page) -> str:
-    for sel in ["#divStudentBanner", "#dvStudentBanner", "#divStudentInfo",
-                "header .student-name", ".studentBanner", ".student-name"]:
+    for sel in ["#divStudentBanner","#dvStudentBanner","#divStudentInfo",".studentBanner",".student-name"]:
         try:
             if page.locator(sel).first.is_visible():
-                return page.locator(sel).first.inner_text(timeout=700)
-        except Exception:
-            pass
+                return page.locator(sel).first.inner_text(timeout=600)
+        except Exception: pass
     return ""
 
 def _visible_texts(page, selectors: List[str], limit=60) -> List[str]:
-    out = []
+    out=[]
     for sel in selectors:
         try:
             loc = page.locator(sel)
-            count = min(loc.count(), limit - len(out))
-            for i in range(count):
-                try:
-                    el = loc.nth(i)
-                    if el.is_visible():
-                        t = el.inner_text(timeout=600).strip()
-                        if t:
-                            out.append(_trim(t, 120))
-                except Exception:
-                    pass
-            if len(out) >= limit:
-                break
-        except Exception:
-            pass
+            n = min(loc.count(), limit-len(out))
+            for i in range(n):
+                el = loc.nth(i)
+                if el.is_visible():
+                    txt = (el.inner_text(timeout=500) or "").strip()
+                    lab = el.get_attribute("aria-label") or ""
+                    tit = el.get_attribute("title") or ""
+                    if txt or lab or tit:
+                        out.append(_trim(" | ".join([v for v in [txt, lab, tit] if v]), 120))
+                if len(out) >= limit: break
+        except Exception: pass
+        if len(out) >= limit: break
     return out
 
-def debug_student_ui_snapshot(page) -> None:
+def debug_student_ui_snapshot(page):
     try:
         dbg(f"UI SNAPSHOT — url: {page.url}")
-        banner = _trim(_banner_text(page), 160)
-        dbg(f"UI SNAPSHOT — banner: {banner or '(none)'}")
-        # student-ish buttons/links
-        texts = _visible_texts(
-            page,
-            [
-                'a:has-text("Student")','button:has-text("Student")','[role=menuitem]:has-text("Student")',
-                'a:has-text("Select")','button:has-text("Select")',
-                ".dropdown-menu a",".dropdown a",".navbar a",".card a",".tile a","button","a"
-            ],
-            limit=30
-        )
-        if texts:
-            dbg("UI SNAPSHOT — clickable texts (sample): " + " | ".join(texts[:15]))
-        # any selects + options
-        options = []
+        banner = _trim(_banner_text(page), 160) or "(none)"
+        dbg(f"UI SNAPSHOT — banner: {banner}")
+        clicks = _visible_texts(page, [
+            "a","button","[role=button]","[role=menuitem]",".dropdown a",".navbar a",".card a",".tile a"
+        ], limit=30)
+        if clicks:
+            dbg("UI SNAPSHOT — clickables(sample): " + " || ".join(clicks[:18]))
+        # options inside any selects
+        options=[]
         try:
-            selects = page.locator("select")
-            for i in range(min(selects.count(), 5)):
-                sel = selects.nth(i)
-                opts = sel.locator("option")
-                for j in range(min(opts.count(), 10)):
-                    try:
-                        txt = opts.nth(j).inner_text(timeout=500).strip()
-                        if txt:
-                            options.append(_trim(txt, 80))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            sels = page.locator("select")
+            for i in range(min(4, sels.count())):
+                opts = sels.nth(i).locator("option")
+                for j in range(min(12, opts.count())):
+                    t = (opts.nth(j).inner_text(timeout=400) or "").strip()
+                    if t: options.append(_trim(t, 80))
+        except Exception: pass
         if options:
-            dbg("UI SNAPSHOT — select options (sample): " + " | ".join(options[:20]))
-    except Exception:
-        pass
+            dbg("UI SNAPSHOT — select options(sample): " + " | ".join(options[:18]))
+    except Exception: pass
 
-# -------------------- switching & scraping --------------------
-
-def _click_any_student_trigger(page) -> None:
-    triggers = [
-        # explicit words
-        'a:has-text("Students")','a:has-text("My Students")','a:has-text("Select Student")',
-        'a:has-text("Change Student")','a:has-text("Switch Student")',
-        'button:has-text("Students")','button:has-text("My Students")','button:has-text("Select Student")',
-        'button:has-text("Change Student")','button:has-text("Switch Student")',
-        # banner sometimes is clickable to switch
-        "#divStudentBanner","#dvStudentBanner","#divStudentInfo",
-        # common dropdown toggles
-        ".dropdown-toggle",'[data-toggle=dropdown]','[aria-haspopup="true"]',
+def _open_menus(page):
+    for sel in [
+        ".navbar-toggler",'button.navbar-toggler','[aria-label*=menu i]','[class*=hamburger i]',
+        ".dropdown-toggle",'[data-toggle=dropdown]','[aria-haspopup=true]',
         ".navbar .dropdown > a",".navbar .dropdown > button",
-        "#studentMenu","#studentPicker",".student-picker",".dropdown:has-text('Student')",
-        ".tile:has-text('Student')",".card:has-text('Student')"
-    ]
-    for sel in triggers:
+        "#studentMenu","#studentPicker",".student-picker",
+    ]:
         _click_if_visible(page, sel)
 
-def _click_by_text(page, name: str) -> bool:
-    pattern = re.compile(re.escape(name), re.I)
-
-    for role in ["link", "button", "menuitem", "option"]:
+def _click_by_text_like(page, needle: str) -> bool:
+    pat = re.compile(re.escape(needle), re.I)
+    for role in ["link","button","menuitem","option"]:
         try:
-            el = page.get_by_role(role, name=pattern).first
-            if el and el.is_visible():
-                el.click(); return True
-        except Exception:
-            pass
-
+            el = page.get_by_role(role, name=pat).first
+            if el and el.is_visible(): el.click(); return True
+        except Exception: pass
     try:
-        el = page.get_by_text(pattern).first
+        el = page.get_by_text(pat, exact=False).first
         if el and el.is_visible():
-            # try itself
+            # click nearest actionable ancestor
             try:
-                tag = (el.evaluate("el => el.tagName") or "").lower()
-            except Exception:
-                tag = ""
-            if tag in ("a", "button", "option"): el.click(); return True
+                tag = (el.evaluate("el=>el.tagName") or "").lower()
+            except Exception: tag = ""
+            if tag in ("a","button","option"): el.click(); return True
             anc = el.locator("xpath=ancestor::*[self::a or self::button or self::option or @role='button'][1]").first
             if anc and anc.is_visible(): anc.click(); return True
-    except Exception:
-        pass
-
+    except Exception: pass
+    # alt/title/aria on images/icons
     try:
         el = page.locator(
-            f'xpath=//*[contains(translate(normalize-space(.),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"{name.lower()}")]'
+            f'[alt*="{needle}" i], [title*="{needle}" i], [aria-label*="{needle}" i]'
         ).first
         if el and el.is_visible(): el.click(); return True
-    except Exception:
-        pass
-
+    except Exception: pass
     return False
 
 def switch_to_student(page, student: str) -> bool:
-    name_cf = (student or "").casefold()
+    target = (student or "").strip()
+    if not target: return False
+    name_cf = target.casefold()
 
-    try:
-        page.goto(PORTAL_HOME, wait_until="domcontentloaded")
-    except Exception:
-        pass
+    try: page.goto(PORTAL_HOME, wait_until="domcontentloaded")
+    except Exception: pass
 
     debug_student_ui_snapshot(page)
-
-    # already on student?
-    btxt = _banner_text(page)
-    if name_cf and (name_cf in _casefold(btxt) or name_cf in _casefold(_body_text_any(page))):
-        dbg(f"switched to student {student} (already active)")
+    # already there?
+    if name_cf in _banner_text(page).casefold() or name_cf in _body_text_any(page).casefold():
+        dbg(f"switched to student {target} (already active)")
         return True
 
-    # round 1: open triggers then click by text
-    _click_any_student_trigger(page)
-    if _click_by_text(page, student):
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if name_cf in _casefold(_banner_text(page)) or name_cf in _casefold(_body_text_any(page)):
-                dbg(f"switched to student {student}")
-                return True
+    # 1) open menus, click obvious links
+    _open_menus(page)
+    for key in ["My Students","Students","Select Student","Change Student","Switch Student",
+                "Assignments","Grades","Gradebook"]:
+        if _click_by_text_like(page, key): break
+    if _click_by_text_like(page, target):
+        deadline = time.time()+10
+        while time.time()<deadline:
+            if name_cf in _banner_text(page).casefold() or name_cf in _body_text_any(page).casefold():
+                dbg(f"switched to student {target}"); return True
             time.sleep(0.2)
 
-    # round 2: expand all dropdowns & menus, then click
-    for sel in [".dropdown-toggle",'[data-toggle=dropdown]','[aria-haspopup=true]','.navbar .dropdown > a', '.navbar .dropdown > button']:
-        _click_if_visible(page, sel)
-    if _click_by_text(page, student):
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if name_cf in _casefold(_banner_text(page)) or name_cf in _casefold(_body_text_any(page)):
-                dbg(f"switched to student {student}")
-                return True
+    # 2) expand any dropdowns and try again
+    _open_menus(page)
+    if _click_by_text_like(page, target):
+        deadline = time.time()+10
+        while time.time()<deadline:
+            if name_cf in _banner_text(page).casefold() or name_cf in _body_text_any(page).casefold():
+                dbg(f"switched to student {target}"); return True
             time.sleep(0.2)
 
-    # round 3: select dropdowns explicitly
-    for sel in ["select#ddlStudent", "select[name*=Student]", "select:has(option)", "[role=combobox]"]:
+    # 3) try selects directly
+    for sel in ["select#ddlStudent","select[name*=Student i]","select:has(option)","[role=combobox]"]:
         try:
             drop = page.locator(sel).first
             if drop and drop.is_visible():
                 try:
-                    drop.select_option(label=re.compile(student, re.I))
+                    drop.select_option(label=re.compile(target, re.I))
                 except Exception:
-                    options = drop.locator("option")
-                    for i in range(min(options.count(), 25)):
-                        txt = options.nth(i).inner_text(timeout=500)
-                        val = options.nth(i).get_attribute("value") or ""
-                        if name_cf in _casefold(txt) or name_cf in _casefold(val):
+                    opts = drop.locator("option")
+                    for i in range(min(30, opts.count())):
+                        txt = (opts.nth(i).inner_text(timeout=400) or "")
+                        val = opts.nth(i).get_attribute("value") or ""
+                        if name_cf in txt.casefold() or name_cf in val.casefold():
                             drop.select_option(value=val); break
-                deadline = time.time() + 10
-                while time.time() < deadline:
-                    if name_cf in _casefold(_banner_text(page)) or name_cf in _casefold(_body_text_any(page)):
-                        dbg(f"switched to student {student}")
-                        return True
-                    time.sleep(0.2)
-        except Exception:
-            pass
+                time.sleep(0.4)
+                if name_cf in _banner_text(page).casefold() or name_cf in _body_text_any(page).casefold():
+                    dbg(f"switched to student {target}"); return True
+        except Exception: pass
 
     debug_student_ui_snapshot(page)
     return False
 
-def ensure_assignments_ready(page) -> Tuple[bool, int]:
+# ---------- assignments ----------
+def ensure_assignments_ready(page) -> Tuple[bool,int]:
     try:
         page.wait_for_selector('table[id^="tblAssign_"]', timeout=6000)
         return True, page.locator('table[id^="tblAssign_"]').count()
     except PlaywrightTimeoutError:
-        for sel in [
-            'a:has-text("Assignments")', 'button:has-text("Assignments")',
-            '.tile:has-text("Assignments")', '.card:has-text("Assignments")',
-            'a[href*="Assignment" i]', 'a[href*="assign" i]'
-        ]:
+        for sel in ['a:has-text("Assignments")','button:has-text("Assignments")',
+                    '.tile:has-text("Assignments")','.card:has-text("Assignments")',
+                    'a[href*="Assign" i]','a[href*="Gradebook" i]']:
             if _click_if_visible(page, sel):
                 try:
                     page.wait_for_selector('table[id^="tblAssign_"]', timeout=6000)
                     return True, page.locator('table[id^="tblAssign_"]').count()
                 except PlaywrightTimeoutError:
                     pass
-        txt = _body_text_any(page, timeout=800)
-        if "No Assignments Available" in txt:
-            return True, 0
+        if "No Assignments Available" in _body_text_any(page): return True, 0
         return False, 0
 
 def _read_headers(table) -> List[str]:
-    headers = []
-    try:
-        headers = [h.strip() for h in table.locator("thead tr th").all_text_contents()]
-    except Exception:
-        pass
-    if not headers:
-        try:
-            headers = [h.strip() for h in table.locator("tr").first.locator("th,td").all_text_contents()]
-        except Exception:
-            headers = []
-    return headers
+    heads=[]
+    try: heads = [h.strip() for h in table.locator("thead tr th").all_text_contents()]
+    except Exception: pass
+    if not heads:
+        try: heads = [h.strip() for h in table.locator("tr").first.locator("th,td").all_text_contents()]
+        except Exception: heads=[]
+    return heads
 
 HEADER_MAP = {
-    "period": "Period", "course": "Course", "section": "Course", "teacher": "Teacher",
-    "due": "DueDate", "due date": "DueDate", "assigned": "AssignedDate", "assigned date": "AssignedDate",
-    "assignment": "Assignment", "points possible": "PtsPossible", "pts possible": "PtsPossible",
-    "points": "PtsPossible", "score": "Score", "percent": "Pct", "%": "Pct",
-    "status": "Status", "comments": "Comments",
+    "period":"Period","course":"Course","section":"Course","teacher":"Teacher",
+    "due":"DueDate","due date":"DueDate","assigned":"AssignedDate","assigned date":"AssignedDate",
+    "assignment":"Assignment","points possible":"PtsPossible","pts possible":"PtsPossible",
+    "points":"PtsPossible","score":"Score","percent":"Pct","%":"Pct",
+    "status":"Status","comments":"Comments",
 }
 OUR_COLS = ["Student","Period","Course","Teacher","DueDate","AssignedDate","Assignment","PtsPossible","Score","Pct","Status","Comments","SourceURL"]
 
-def _normalize_headers(raw_headers: Iterable[str]) -> Dict[int, str]:
-    mapping: Dict[int, str] = {}
-    for idx, h in enumerate(raw_headers):
-        key = (re.sub(r"\s+", " ", h.strip()) or "").casefold()
+def _normalize_headers(raw: Iterable[str]) -> Dict[int,str]:
+    mapping={}
+    for i,h in enumerate(raw):
+        key = (re.sub(r"\s+"," ",h.strip()) or "").casefold()
         norm = HEADER_MAP.get(key)
         if not norm:
-            for k, v in HEADER_MAP.items():
-                if k in key: norm = v; break
-        if norm: mapping[idx] = norm
+            for k,v in HEADER_MAP.items():
+                if k in key: norm=v; break
+        if norm: mapping[i]=norm
     return mapping
 
-def extract_assignments_for_student(page, student: str) -> Tuple[List[List[str]], int]:
+def extract_assignments_for_student(page, student: str) -> Tuple[List[List[str]],int]:
     ok, table_count = ensure_assignments_ready(page)
-    if not ok:
-        return [], 0
+    if not ok: return [], 0
 
-    out_rows: List[List[str]] = []
+    out=[]
     tables = page.locator('table[id^="tblAssign_"]')
-
     try:
-        ids = []
+        ids=[]
         for i in range(tables.count()):
             try: ids.append(tables.nth(i).get_attribute("id") or "")
             except Exception: pass
         if ids: dbg(f"found assignment tables (ids): {ids}")
-    except Exception:
-        pass
+    except Exception: pass
 
     for ti in range(tables.count()):
         table = tables.nth(ti)
         headers = _read_headers(table)
-        colmap = _normalize_headers(headers)
-
+        colmap  = _normalize_headers(headers)
         trs = table.locator("tbody tr")
         for r in range(trs.count()):
             tds = trs.nth(r).locator("td")
-            d = {c: "" for c in OUR_COLS}
-            d["Student"] = student
-            d["SourceURL"] = page.url
-
+            d = {c:"" for c in OUR_COLS}
+            d["Student"]=student
+            d["SourceURL"]=page.url
             for c in range(tds.count()):
-                txt = ""
-                try: txt = tds.nth(c).inner_text(timeout=800).strip()
-                except Exception: pass
+                try: txt = tds.nth(c).inner_text(timeout=700).strip()
+                except Exception: txt=""
                 key = colmap.get(c)
-                if key: d[key] = txt
+                if key: d[key]=txt
+            out.append([d[k] for k in OUR_COLS])
+    return out, table_count
 
-            out_rows.append([d[k] for k in OUR_COLS])
-
-    return out_rows, table_count
-
-def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[List[str]], Dict[str, int]]:
-    all_rows: List[List[str]] = []
-    metrics = {"tables_total": 0, "students_processed": 0}
+# ---------- runner ----------
+def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[List[str]], Dict[str,int]]:
+    rows=[]
+    metrics={"tables_total":0,"students_processed":0}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--lang=en-US"],
+            args=["--disable-blink-features=AutomationControlled","--lang=en-US"],
         )
         ctx = browser.new_context(
-            viewport={"width": 1366, "height": 900},
+            viewport={"width":1366,"height":900},
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/126.0.0.0 Safari/537.36"),
             locale="en-US",
             timezone_id="America/Los_Angeles",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Sec-CH-UA-Platform": "Windows",
-                "Sec-CH-UA": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
-                "Sec-CH-UA-Mobile": "?0",
-            },
+            extra_http_headers={"Accept-Language":"en-US,en;q=0.9"},
         )
         page = ctx.new_page()
 
@@ -565,13 +410,13 @@ def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[
                 dbg(f"skipping extraction for '{s}' (could not switch)")
                 continue
 
-            rows, tbl_count = extract_assignments_for_student(page, s)
-            dbg(f"class tables for {s}: {tbl_count}")
-            all_rows.extend(rows)
-            metrics["tables_total"] += tbl_count
+            r, cnt = extract_assignments_for_student(page, s)
+            dbg(f"class tables for {s}: {cnt}")
+            rows.extend(r)
+            metrics["tables_total"] += cnt
             metrics["students_processed"] += 1
 
         browser.close()
 
-    dbg(f"scraped {len(all_rows)} rows from portal")
-    return all_rows, metrics
+    dbg(f"scraped {len(rows)} rows from portal")
+    return rows, metrics
