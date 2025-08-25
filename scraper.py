@@ -31,13 +31,10 @@ def login_and_wait(page, username, password):
     pw.fill(password)
     page.click("#LoginButton")
 
-    # Wait until the portal furniture is present
     page.wait_for_selector("#divStudentBanner", timeout=30000)
     print("DEBUG – after login: portal loaded")
 
 def show_student_tiles(page):
-    # Tiles are behind the "family" icon / header cell with id=openSelect
-    # If not visible, click to open.
     tiles_container = page.locator("#divSelectStudent")
     if tiles_container.is_visible():
         return True
@@ -49,12 +46,6 @@ def show_student_tiles(page):
         return False
 
 def build_student_tile_map(page):
-    """
-    Returns: dict keyed by lowercase nickname -> {
-        'tile_id': '357342',            # from id suffix stuTile_357342
-        'selector': '#stuTile_357342'
-    }
-    """
     ok = show_student_tiles(page)
     print(f"DEBUG – saw student tiles: {ok}")
     mapping = {}
@@ -64,7 +55,7 @@ def build_student_tile_map(page):
 
     tiles = page.query_selector_all(".studentTile")
     for t in tiles:
-        tile_id_full = t.get_attribute("id") or ""          # e.g. stuTile_357342
+        tile_id_full = t.get_attribute("id") or ""   # e.g. stuTile_357342
         tile_id_num = tile_id_full.split("_")[-1]
         nick_el = t.query_selector(".tileStudentNickname")
         nickname = (_text(nick_el)).lower()
@@ -76,45 +67,35 @@ def build_student_tile_map(page):
     return mapping
 
 def current_student_banner_id(page):
-    """The hidden #hStudentID holds the numeric banner ID (e.g. 357342)."""
     try:
         return page.eval_on_selector("#hStudentID", "el => el.value")
     except Exception:
         return None
 
 def switch_to_student(page, nickname, tile_map):
-    """
-    Switches to the student whose tile nickname matches `nickname` (case-insensitive).
-    Uses the exact SetStudentBanner flow the page binds to .studentTile clicks.
-    """
     target = tile_map.get(nickname.lower())
     if not target:
         print(f"DEBUG – could not find tile for {nickname}")
         return False
 
-    target_id = target["tile_id"]  # this should match #hStudentID after switch
+    target_id = target["tile_id"]
     cur_id = current_student_banner_id(page)
 
-    # If we're already on that student, treat as success.
     if cur_id == target_id:
         print(f"DEBUG – already on student {nickname} (id {target_id})")
-        # Close the tile picker if it's open
         if page.locator("#divSelectStudent").is_visible():
             page.locator("#openSelect").click()
         return True
 
-    # Ensure tiles visible, then click the tile
     show_student_tiles(page)
     page.click(target["selector"])
 
-    # Wait until #hStudentID reflects the chosen tile id
     try:
         page.wait_for_function(
             """(id) => document.querySelector('#hStudentID') && document.querySelector('#hStudentID').value === id""",
             arg=target_id,
             timeout=15000
         )
-        # Close the tile picker if it remained open
         if page.locator("#divSelectStudent").is_visible():
             page.locator("#openSelect").click()
         print(f"DEBUG – switched to student {nickname}")
@@ -123,53 +104,90 @@ def switch_to_student(page, nickname, tile_map):
         print(f"DEBUG – failed to switch to student {nickname}")
         return False
 
-def ensure_assignments_visible(page):
+def ensure_assignments_ready(page):
     """
-    Click the left menu 'Assignments' if needed and wait for tables to appear.
+    Open the Assignments area and wait until tables (or the tablecount marker)
+    are present. Returns True if something assignment-related is found.
     """
-    # The menu row has id=Assignments; clicking toggles its panel
+    # Make sure the left-menu row is present
     menu_row = page.locator("tr#Assignments")
     if menu_row.count() == 0:
         return False
 
-    # Make sure the content div exists
-    content_root = page.locator("#SP_Assignments")
-    if not content_root.is_visible():
+    # Click once to ensure it's selected/expanded
+    try:
         menu_row.click()
-
-    # Wait for tables or a clear sign of empty content
-    try:
-        page.wait_for_selector("#SP_Assignments", timeout=10000)
-    except PWTimeout:
-        return False
-
-    # Force panel open (sometimes already selected; clicking image toggles)
-    try:
-        hdr_toggle = page.locator("#img_Assignments")
-        if hdr_toggle.count() > 0 and "collapse" not in (hdr_toggle.get_attribute("src") or "").lower():
-            menu_row.click()
     except Exception:
         pass
 
-    # Give the panel a moment to render dynamic body
-    page.wait_for_timeout(500)
+    # The content root/area
+    try:
+        page.wait_for_selector("#trSP1_Assignments, #SP_Assignments", timeout=8000)
+    except PWTimeout:
+        return False
 
+    # Wait for either the hidden count or any assignment table or the empty state
+    try:
+        page.wait_for_selector("input#tablecount, #SP_Assignments table.tblassign, table.tblassign, text=No Assignments Available", timeout=10000)
+    except PWTimeout:
+        # As a last nudge, small wait and continue
+        page.wait_for_timeout(500)
+
+    # Log tablecount if present
+    tablecount_val = "?"
+    try:
+        tablecount_val = page.eval_on_selector("input#tablecount", "el => el.value")
+    except Exception:
+        pass
+    print(f"DEBUG – tablecount marker: {tablecount_val}")
+
+    # Small wait to allow rendering
+    page.wait_for_timeout(300)
     return True
+
+def collect_assignment_tables(page):
+    """
+    Return a de-duplicated list of assignment table elements using multiple selectors.
+    """
+    selectors = [
+        "#SP_Assignments table.tblassign",
+        "table.tblassign",
+        "table[id^='tblAssign_']",
+    ]
+    seen = set()
+    tables = []
+    for sel in selectors:
+        try:
+            for el in page.query_selector_all(sel):
+                rid = el.get_attribute("id") or f"ptr-{id(el)}"
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                tables.append(el)
+        except Exception:
+            pass
+
+    # Debug: list ids we found
+    ids = []
+    for el in tables:
+        ids.append(el.get_attribute("id") or "(no id)")
+    print(f"DEBUG – found assignment tables (ids): {ids}")
+    return tables
 
 PCT_RE = re.compile(r"(\d+(?:\.\d+)?)%")
 
 def extract_assignments_for_student(page, student_name):
     """
     Returns (rows, counts)
-      rows: list[list] -> [timestamp, student, course, assignment, due_date, pct, status]
+      rows: [timestamp, student, course, assignment, due_date, pct, status]
       counts: dict with 'flags' (missing+low) and 'wins'
     """
-    ok = ensure_assignments_visible(page)
+    ok = ensure_assignments_ready(page)
     if not ok:
-        print(f"DEBUG – Assignments panel not visible for {student_name}")
+        print(f"DEBUG – Assignments panel not ready for {student_name}")
         return [], {"flags": 0, "wins": 0}
 
-    tables = page.query_selector_all("#SP_Assignments table.tblassign")
+    tables = collect_assignment_tables(page)
     print(f"DEBUG – class tables for {student_name}: {len(tables)}")
 
     out_rows = []
@@ -178,19 +196,15 @@ def extract_assignments_for_student(page, student_name):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for tbl in tables:
-        # Course from caption text (e.g., "Per: 2  CC Math 6 (T2201YF1)")
+        # Course name from caption
         cap = _first(tbl, "caption")
         course_text = _text(cap)
-        if course_text:
-            # Normalize "Per: X ..." -> just keep after the colon
-            if "Per" in course_text and ":" in course_text:
-                course = course_text.split(":", 1)[1].strip()
-            else:
-                course = course_text
+        if course_text and "Per" in course_text and ":" in course_text:
+            course = course_text.split(":", 1)[1].strip()
         else:
-            course = ""
+            course = course_text or ""
 
-        # Rows in <tbody>
+        # Body rows
         rows = tbl.query_selector_all("tbody > tr")
         for tr in rows:
             tr_text = _text(tr)
@@ -200,13 +214,12 @@ def extract_assignments_for_student(page, student_name):
             tr_class = (tr.get_attribute("class") or "").lower()
             is_missing = "missingassignment" in tr_class
 
-            # Grab useful cells by IDs if present
             due_el = _first(tr, 'td[id^="ddate"]')
             desc_el = _first(tr, 'td[id^="descript"]')
             due_date = _text(due_el)
             assignment = _text(desc_el)
 
-            # Try to find a percentage cell anywhere in the row
+            # Find a % anywhere in the row
             pct = ""
             for td in tr.query_selector_all("td"):
                 m = PCT_RE.search(_text(td))
@@ -228,7 +241,7 @@ def extract_assignments_for_student(page, student_name):
                         status = "LOW"
                         missing_or_low += 1
                 except Exception:
-                    pass  # leave status empty if pct parsing fails
+                    pass
 
             if status:
                 out_rows.append([ts, student_name, course, assignment, due_date, pct, status])
@@ -254,13 +267,10 @@ def run_scrape(username, password, students):
         page = context.new_page()
         page.set_default_timeout(15000)
 
-        # 1) Login
         login_and_wait(page, username, password)
 
-        # 2) Get the student tiles map once; it persists across switches
         tile_map = build_student_tile_map(page)
 
-        # 3) Walk each requested student
         for s in students:
             switched = switch_to_student(page, s, tile_map)
             if not switched:
