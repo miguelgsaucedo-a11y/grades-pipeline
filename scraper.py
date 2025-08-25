@@ -10,7 +10,7 @@ PORTAL_BASE = "https://parentportal.cajonvalley.net"
 PORTAL_HOME = f"{PORTAL_BASE}/Home/PortalMainPage"
 
 LOGON_PATHS = [
-    "/",  # root landing often has the login block
+    "/",
     "/Account/LogOn",
     "/Account/Login",
     "/Account/LogOn?ReturnUrl=%2FHome%2FPortalMainPage",
@@ -53,7 +53,7 @@ def _body_text_any(page, timeout=1000) -> str:
                 parts.append(_trim(t, 180))
         except Exception:
             pass
-    return " | ".join(parts)[:600]
+    return " | ".join(parts)[:800]
 
 def _first_visible(page, selector: str):
     for fr in _all_frames(page):
@@ -154,7 +154,6 @@ def _navigate_to_login(page) -> Tuple[bool, object, str, str]:
             pass
         _dismiss_timeout_any(page)
 
-        # any obvious triggers on the landing page
         for sel in [
             'a:has-text("ParentPortal Login")', 'a:has-text("Parent Portal Login")',
             'a:has-text("Log On")', 'a:has-text("Login")', 'a:has-text("Sign In")',
@@ -180,7 +179,6 @@ def _navigate_to_login(page) -> Tuple[bool, object, str, str]:
                 _dismiss_timeout_any(page)
                 continue
 
-            # collapsed login panel on root/home
             for sel in ['a:has-text("ParentPortal Login")','button:has-text("ParentPortal Login")',
                         'a:has-text("Parent Portal Login")','button:has-text("Parent Portal Login")']:
                 _click_if_visible(page, sel)
@@ -191,7 +189,7 @@ def _navigate_to_login(page) -> Tuple[bool, object, str, str]:
         page.wait_for_timeout(400)
 
     dbg(f"login DEBUG — url now: {page.url}")
-    dbg(f"login DEBUG — body: {_trim(_body_text_any(page))}")
+    dbg(f"login DEBUG — body≈ {_trim(_body_text_any(page))}")
     return False, None, "", ""
 
 def login(page, username: str, password: str) -> None:
@@ -223,12 +221,10 @@ def login(page, username: str, password: str) -> None:
         try: target.locator('input[type="password"]').first.fill(password)
         except Exception: pass
 
-    # submit
     if not any(_click_if_visible(target, sel) for sel in SUBMIT_SELECTORS):
         try: target.keyboard.press("Enter")
         except Exception: pass
 
-    # wait until portal is usable
     deadline = time.time() + 20
     while time.time() < deadline:
         try: page.wait_for_load_state("domcontentloaded", timeout=1000)
@@ -243,14 +239,14 @@ def login(page, username: str, password: str) -> None:
         time.sleep(0.25)
     dbg("after login: portal loaded")
 
-# -------------------- student switching & scraping --------------------
+# -------------------- student UI discovery --------------------
 
 def _casefold(s: str) -> str:
     return (s or "").casefold()
 
 def _banner_text(page) -> str:
     for sel in ["#divStudentBanner", "#dvStudentBanner", "#divStudentInfo",
-                "header", "h1", "h2", ".studentBanner", ".student-name"]:
+                "header .student-name", ".studentBanner", ".student-name"]:
         try:
             if page.locator(sel).first.is_visible():
                 return page.locator(sel).first.inner_text(timeout=700)
@@ -258,31 +254,96 @@ def _banner_text(page) -> str:
             pass
     return ""
 
+def _visible_texts(page, selectors: List[str], limit=60) -> List[str]:
+    out = []
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), limit - len(out))
+            for i in range(count):
+                try:
+                    el = loc.nth(i)
+                    if el.is_visible():
+                        t = el.inner_text(timeout=600).strip()
+                        if t:
+                            out.append(_trim(t, 120))
+                except Exception:
+                    pass
+            if len(out) >= limit:
+                break
+        except Exception:
+            pass
+    return out
+
+def debug_student_ui_snapshot(page) -> None:
+    try:
+        dbg(f"UI SNAPSHOT — url: {page.url}")
+        banner = _trim(_banner_text(page), 160)
+        dbg(f"UI SNAPSHOT — banner: {banner or '(none)'}")
+        # student-ish buttons/links
+        texts = _visible_texts(
+            page,
+            [
+                'a:has-text("Student")','button:has-text("Student")','[role=menuitem]:has-text("Student")',
+                'a:has-text("Select")','button:has-text("Select")',
+                ".dropdown-menu a",".dropdown a",".navbar a",".card a",".tile a","button","a"
+            ],
+            limit=30
+        )
+        if texts:
+            dbg("UI SNAPSHOT — clickable texts (sample): " + " | ".join(texts[:15]))
+        # any selects + options
+        options = []
+        try:
+            selects = page.locator("select")
+            for i in range(min(selects.count(), 5)):
+                sel = selects.nth(i)
+                opts = sel.locator("option")
+                for j in range(min(opts.count(), 10)):
+                    try:
+                        txt = opts.nth(j).inner_text(timeout=500).strip()
+                        if txt:
+                            options.append(_trim(txt, 80))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if options:
+            dbg("UI SNAPSHOT — select options (sample): " + " | ".join(options[:20]))
+    except Exception:
+        pass
+
+# -------------------- switching & scraping --------------------
+
 def _click_any_student_trigger(page) -> None:
-    # Open any menu/tile that likely exposes student choices
     triggers = [
-        'a:has-text("Students")', 'a:has-text("My Students")', 'a:has-text("Select Student")',
-        'button:has-text("Students")', 'button:has-text("My Students")', 'button:has-text("Select Student")',
-        '[id*="student"][aria-haspopup="true"]', '[data-toggle=dropdown][id*="student" i]',
-        '#studentMenu', '#studentPicker', '.student-picker', '.dropdown:has-text("Student")',
-        '.tile:has-text("Student")', '.card:has-text("Student")'
+        # explicit words
+        'a:has-text("Students")','a:has-text("My Students")','a:has-text("Select Student")',
+        'a:has-text("Change Student")','a:has-text("Switch Student")',
+        'button:has-text("Students")','button:has-text("My Students")','button:has-text("Select Student")',
+        'button:has-text("Change Student")','button:has-text("Switch Student")',
+        # banner sometimes is clickable to switch
+        "#divStudentBanner","#dvStudentBanner","#divStudentInfo",
+        # common dropdown toggles
+        ".dropdown-toggle",'[data-toggle=dropdown]','[aria-haspopup="true"]',
+        ".navbar .dropdown > a",".navbar .dropdown > button",
+        "#studentMenu","#studentPicker",".student-picker",".dropdown:has-text('Student')",
+        ".tile:has-text('Student')",".card:has-text('Student')"
     ]
     for sel in triggers:
         _click_if_visible(page, sel)
 
 def _click_by_text(page, name: str) -> bool:
-    """Find a clickable ancestor (a/button) for a node that contains the name."""
     pattern = re.compile(re.escape(name), re.I)
 
-    # role based
-    for role in ["link", "button", "menuitem"]:
+    for role in ["link", "button", "menuitem", "option"]:
         try:
             el = page.get_by_role(role, name=pattern).first
-            if el and el.is_visible(): el.click(); return True
+            if el and el.is_visible():
+                el.click(); return True
         except Exception:
             pass
 
-    # generic text -> nearest clickable ancestor
     try:
         el = page.get_by_text(pattern).first
         if el and el.is_visible():
@@ -291,16 +352,16 @@ def _click_by_text(page, name: str) -> bool:
                 tag = (el.evaluate("el => el.tagName") or "").lower()
             except Exception:
                 tag = ""
-            if tag in ("a", "button"): el.click(); return True
-            # bubble up to clickable ancestor
-            anc = el.locator("xpath=ancestor::*[self::a or self::button or @role='button'][1]").first
+            if tag in ("a", "button", "option"): el.click(); return True
+            anc = el.locator("xpath=ancestor::*[self::a or self::button or self::option or @role='button'][1]").first
             if anc and anc.is_visible(): anc.click(); return True
     except Exception:
         pass
 
-    # last resort: any element containing text then click it
     try:
-        el = page.locator(f'xpath=//*[contains(translate(normalize-space(.),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"{name.lower()}")]').first
+        el = page.locator(
+            f'xpath=//*[contains(translate(normalize-space(.),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"{name.lower()}")]'
+        ).first
         if el and el.is_visible(): el.click(); return True
     except Exception:
         pass
@@ -308,21 +369,23 @@ def _click_by_text(page, name: str) -> bool:
     return False
 
 def switch_to_student(page, student: str) -> bool:
-    name_cf = _casefold(student)
+    name_cf = (student or "").casefold()
+
     try:
         page.goto(PORTAL_HOME, wait_until="domcontentloaded")
     except Exception:
         pass
 
-    # If we already show the student's name in banner/body, accept it
-    if name_cf and (name_cf in _casefold(_banner_text(page)) or name_cf in _casefold(_body_text_any(page))):
+    debug_student_ui_snapshot(page)
+
+    # already on student?
+    btxt = _banner_text(page)
+    if name_cf and (name_cf in _casefold(btxt) or name_cf in _casefold(_body_text_any(page))):
         dbg(f"switched to student {student} (already active)")
         return True
 
-    # open student switchers/menus
+    # round 1: open triggers then click by text
     _click_any_student_trigger(page)
-
-    # attempt direct clicks/roles/ancestor heuristics
     if _click_by_text(page, student):
         deadline = time.time() + 10
         while time.time() < deadline:
@@ -331,27 +394,18 @@ def switch_to_student(page, student: str) -> bool:
                 return True
             time.sleep(0.2)
 
-    # try common “tiles/cards” and dropdowns explicitly
-    for sel in [".studentTile a", ".studentTile", "a.card, .card a, .tile a, .tile"]:
-        try:
-            locs = page.locator(sel)
-            count = min(locs.count(), 16)
-            for i in range(count):
-                el = locs.nth(i)
-                text = ""
-                try: text = el.inner_text(timeout=600)
-                except Exception: pass
-                if name_cf in _casefold(text):
-                    el.click()
-                    deadline = time.time() + 10
-                    while time.time() < deadline:
-                        if name_cf in _casefold(_banner_text(page)) or name_cf in _casefold(_body_text_any(page)):
-                            dbg(f"switched to student {student}")
-                            return True
-                        time.sleep(0.2)
-        except Exception:
-            pass
+    # round 2: expand all dropdowns & menus, then click
+    for sel in [".dropdown-toggle",'[data-toggle=dropdown]','[aria-haspopup=true]','.navbar .dropdown > a', '.navbar .dropdown > button']:
+        _click_if_visible(page, sel)
+    if _click_by_text(page, student):
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if name_cf in _casefold(_banner_text(page)) or name_cf in _casefold(_body_text_any(page)):
+                dbg(f"switched to student {student}")
+                return True
+            time.sleep(0.2)
 
+    # round 3: select dropdowns explicitly
     for sel in ["select#ddlStudent", "select[name*=Student]", "select:has(option)", "[role=combobox]"]:
         try:
             drop = page.locator(sel).first
@@ -360,7 +414,7 @@ def switch_to_student(page, student: str) -> bool:
                     drop.select_option(label=re.compile(student, re.I))
                 except Exception:
                     options = drop.locator("option")
-                    for i in range(options.count()):
+                    for i in range(min(options.count(), 25)):
                         txt = options.nth(i).inner_text(timeout=500)
                         val = options.nth(i).get_attribute("value") or ""
                         if name_cf in _casefold(txt) or name_cf in _casefold(val):
@@ -374,6 +428,7 @@ def switch_to_student(page, student: str) -> bool:
         except Exception:
             pass
 
+    debug_student_ui_snapshot(page)
     return False
 
 def ensure_assignments_ready(page) -> Tuple[bool, int]:
@@ -381,7 +436,6 @@ def ensure_assignments_ready(page) -> Tuple[bool, int]:
         page.wait_for_selector('table[id^="tblAssign_"]', timeout=6000)
         return True, page.locator('table[id^="tblAssign_"]').count()
     except PlaywrightTimeoutError:
-        # try to navigate via any Assignments tile/link
         for sel in [
             'a:has-text("Assignments")', 'button:has-text("Assignments")',
             '.tile:has-text("Assignments")', '.card:has-text("Assignments")',
