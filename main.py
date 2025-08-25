@@ -1,164 +1,136 @@
-import os
-import time
-import json
-import datetime as dt
-from typing import Dict, List, Tuple
+# main.py
+import os, json, time, hashlib
+from datetime import datetime
+from typing import List, Dict, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 from scraper import run_scrape
 
-# ======== Config from env ========
-PORTAL_USER = os.getenv("PORTAL_USER", "")
-PORTAL_PASS = os.getenv("PORTAL_PASS", "")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "")
-STUDENTS_CSV = os.getenv("STUDENTS", "")
-
-if not (PORTAL_USER and PORTAL_PASS and SPREADSHEET_ID and GOOGLE_CREDS_JSON and STUDENTS_CSV):
-    print("ERROR: Missing one or more required environment variables.")
-    exit(1)
-
-students: List[str] = [s.strip() for s in STUDENTS_CSV.split(",") if s.strip()]
-print(f"DEBUG – students: {students!r}")
-
-# ======== Sheets setup ========
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+HEADERS = [
+    "ImportedAt","Student","Period","Course","Teacher",
+    "DueDate","AssignedDate","Assignment","PtsPossible","Score","Pct",
+    "Status","Comments","SourceURL"
 ]
 
-creds_info = json.loads(GOOGLE_CREDS_JSON)
-credentials = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-gc = gspread.authorize(credentials)
-ss = gc.open_by_key(SPREADSHEET_ID)
+def _creds_from_env():
+    info = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
+    if not info:
+        raise RuntimeError("GOOGLE_CREDS_JSON is empty")
+    data = json.loads(info)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    return Credentials.from_service_account_info(data, scopes=scopes)
 
-ASSIGN_SHEET_NAME = "Assignments"
-GRADES_SHEET_NAME = "Grades"
+def _open_sheets(spreadsheet_id: str):
+    gc = gspread.authorize(_creds_from_env())
+    sh = gc.open_by_key(spreadsheet_id)
 
-ASSIGN_HEADERS = [
-    "ImportedAt", "Student", "Period", "Course", "Teacher",
-    "DueDate", "AssignedDate", "Assignment",
-    "PtsPossible", "Score", "Pct",
-    "Status", "Comments", "SourceURL"
-]
+    # Raw data sheet (first sheet)
+    ws = sh.sheet1
 
-GRADES_HEADERS = [
-    "ImportedAt", "Student", "Course", "Teacher",
-    "GradeLetter", "PointsEarned", "PointsPossible", "SourceURL"
-]
-
-
-def get_or_create_ws(title: str, headers: List[str]):
+    # Create/ensure Grades sheet for snapshotting overall grades later
     try:
-        ws = ss.worksheet(title)
-        # Make sure headers exist (don’t overwrite data)
-        try:
-            current = ws.row_values(1)
-            if current != headers:
-                ws.update('A1', [headers])
-        except Exception:
-            ws.update('A1', [headers])
-        return ws
+        grades_ws = sh.worksheet("Grades")
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=title, rows=1000, cols=len(headers) + 2)
-        ws.update('A1', [headers])
-        return ws
+        grades_ws = sh.add_worksheet(title="Grades", rows=1000, cols=10)
+        grades_ws.update("A1", [["ImportedAt","Student","Course","GradeText","SourceURL"]])
+    return ws, grades_ws
 
+def _sheet_headers(ws):
+    try:
+        got = ws.row_values(1)
+        return [h.strip() for h in got]
+    except Exception:
+        return []
 
-def normalize(s: str) -> str:
-    return " ".join((s or "").strip().lower().split())
+def _ensure_headers(ws):
+    current = _sheet_headers(ws)
+    if current != HEADERS:
+        # gspread changed arg order; pass values first, then range_name via kw.
+        ws.update(values=[HEADERS], range_name="A1")
 
+def _existing_keys(ws) -> set:
+    # Build a set of de-dup keys from existing rows
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return set()
+    idx = {h:i for i,h in enumerate(values[0])}
+    keyset = set()
+    for r in values[1:]:
+        def g(col): return r[idx[col]] if col in idx and idx[col] < len(r) else ""
+        key = (g("Student"), g("Course"), g("Assignment"), g("DueDate"), g("AssignedDate"))
+        keyset.add(key)
+    return keyset
 
-def dedup_key(row: Dict[str, str]) -> Tuple[str, str, str, str]:
-    # A stable key that shouldn’t change when we fix course/period later
+def _row_key(row: Dict) -> Tuple[str,str,str,str,str]:
     return (
-        normalize(row.get("Student", "")),
-        normalize(row.get("Assignment", "")),
-        normalize(row.get("DueDate", "")),
-        normalize(row.get("Teacher", "")),
+        row.get("Student",""),
+        row.get("Course",""),
+        row.get("Assignment",""),
+        row.get("DueDate",""),
+        row.get("AssignedDate",""),
     )
 
-
-def sheet_existing_keys(ws) -> set:
-    keys = set()
-    data = ws.get_all_records()
-    for r in data:
-        keys.add(dedup_key(r))
-    return keys
-
-
-def append_rows(ws, rows: List[Dict[str, str]], header_order: List[str]) -> int:
-    """Append only non-duplicate rows; return # inserted."""
-    if not rows:
-        return 0
-    existing = sheet_existing_keys(ws)
-    to_add = []
+def _rows_to_values(rows: List[Dict]) -> List[List[str]]:
+    out = []
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     for r in rows:
-        key = dedup_key(r)
-        if key not in existing:
-            to_add.append([r.get(h, "") for h in header_order])
-            existing.add(key)
-    if not to_add:
-        return 0
-    ws.append_rows(to_add, value_input_option="RAW")
-    return len(to_add)
-
-
-def legacy_cleanup(ws, header_order: List[str]) -> int:
-    """Optional cleanup: enforce uniqueness by our key across the whole sheet."""
-    data = ws.get_all_records()
-    seen = set()
-    cleaned = []
-    removed = 0
-    for r in data:
-        k = dedup_key(r)
-        if k in seen:
-            removed += 1
-            continue
-        seen.add(k)
-        cleaned.append([r.get(h, "") for h in header_order])
-    if removed:
-        ws.clear()
-        ws.update('A1', [header_order])
-        if cleaned:
-            ws.append_rows(cleaned, value_input_option="RAW")
-    return removed
-
+        out.append([
+            now,
+            r.get("Student",""),
+            r.get("Period",""),
+            r.get("Course",""),
+            r.get("Teacher",""),
+            r.get("DueDate",""),
+            r.get("AssignedDate",""),
+            r.get("Assignment",""),
+            r.get("PtsPossible",""),
+            r.get("Score",""),
+            r.get("Pct",""),
+            r.get("Status",""),
+            r.get("Comments",""),
+            r.get("SourceURL",""),
+        ])
+    return out
 
 def main():
-    assign_ws = get_or_create_ws(ASSIGN_SHEET_NAME, ASSIGN_HEADERS)
-    grades_ws = get_or_create_ws(GRADES_SHEET_NAME, GRADES_HEADERS)
+    username = os.environ.get("PORTAL_USER","").strip()
+    password = os.environ.get("PORTAL_PASS","").strip()
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID","").strip()
+    students_env = os.environ.get("STUDENTS","").strip()
+    students = [s.strip() for s in students_env.split(",") if s.strip()]
 
-    # Scrape portal
-    try:
-        rows, grade_rows = run_scrape(PORTAL_USER, PORTAL_PASS, students)
-    except Exception as e:
-        print("ERROR during scrape:", repr(e))
-        raise
+    print(f"DEBUG — students: {students}")
 
-    print(f"DEBUG – scraped {len(rows)} rows from portal")
-    imported_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not (username and password and spreadsheet_id and students):
+        raise RuntimeError("Missing one of PORTAL_USER, PORTAL_PASS, SPREADSHEET_ID, STUDENTS")
 
-    # stamp ImportedAt
-    for r in rows:
-        r["ImportedAt"] = imported_at
-    for g in grade_rows:
-        g["ImportedAt"] = imported_at
+    # Scrape
+    rows, metrics = run_scrape(username, password, students)
 
-    # Append with de-dup
-    inserted = append_rows(assign_ws, rows, ASSIGN_HEADERS)
-    print(f"Imported {inserted} new rows. Skipped as duplicates (before append): {len(rows) - inserted}.")
+    print(f"DEBUG — UI SNAPSHOT — url: {metrics.get('ui_url')}")
+    print(f"DEBUG — UI SNAPSHOT — sample: {metrics.get('ui_sample') or '(none)'}")
+    for s, n in metrics.get("per_student_table_counts", {}).items():
+        print(f"DEBUG — class tables for {s}: {n}")
 
-    # Optional cleanup pass to remove legacy dupes
-    removed = legacy_cleanup(assign_ws, ASSIGN_HEADERS)
-    print(f"Removed legacy dups during cleanup: {removed}.")
+    # Sheets
+    ws, grades_ws = _open_sheets(spreadsheet_id)
+    _ensure_headers(ws)
 
-    # Append grade snapshots
-    grades_inserted = append_rows(grades_ws, grade_rows, GRADES_HEADERS)
-    print(f"Inserted {grades_inserted} grade snapshots to '{GRADES_SHEET_NAME}'.")
+    # De-dup before append
+    existing = _existing_keys(ws)
+    new_rows = [r for r in rows if _row_key(r) not in existing]
 
+    print(f"DEBUG — scraped {len(rows)} rows from portal")
+    print(f"Imported {len(new_rows)} new rows. Skipped as duplicates (before append): {len(rows) - len(new_rows)}.")
+
+    if new_rows:
+        ws.append_rows(_rows_to_values(new_rows), value_input_option="USER_ENTERED")
+
+    # (Optional) snapshot overall grade later if/when we add a reliable source.
+    # For now we insert nothing unless you wire up a grade string.
+    print("Inserted 0 grade snapshots to 'Grades'.")
 
 if __name__ == "__main__":
     main()
