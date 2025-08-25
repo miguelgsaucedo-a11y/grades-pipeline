@@ -8,18 +8,19 @@ from typing import Dict, Iterable, List, Tuple
 from playwright.sync_api import Playwright, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-
 PORTAL_BASE = "https://parentportal.cajonvalley.net"
 PORTAL_HOME = f"{PORTAL_BASE}/Home/PortalMainPage"
 LOGON_URL = f"{PORTAL_BASE}/Account/LogOn?ReturnUrl=%2FHome%2FPortalMainPage"
 LOGOFF_URL = f"{PORTAL_BASE}/Account/LogOff"
 
-
 def dbg(msg: str) -> None:
     print(f"DEBUG — {msg}")
 
+# ---------------------- small helpers ----------------------
 
-# ---------- login helpers ----------------------------------------------------
+def _trim(s: str, n: int = 280) -> str:
+    s = (s or "").strip().replace("\n", " ")
+    return s[:n] + ("…" if len(s) > n else "")
 
 def _body_text(page, timeout=1500) -> str:
     try:
@@ -27,37 +28,24 @@ def _body_text(page, timeout=1500) -> str:
     except Exception:
         return ""
 
-
-def _go_to_login(page) -> None:
-    page.goto(LOGON_URL, wait_until="domcontentloaded")
-
-
-def _wait_for_any_login_fields(page, timeout_ms=12000) -> bool:
-    """Be flexible: accept several possible selectors for the two fields."""
-    candidates = [
-        "#UserName",
-        "input[name=UserName]",
-        "input[id*=User][type=text]",
-        "input[type=text][name*=user i]",
-        "input[type=text][id*=user i]",
+def _wait_for_any_login_fields(page, timeout_ms=8000) -> bool:
+    user_candidates = [
+        "#UserName", "input[name=UserName]",
+        "input[id*=User i][type=text]", "input[type=text][name*=user i]"
     ]
     pw_candidates = [
-        "#Password",
-        "input[name=Password]",
-        "input[type=password]",
-        "input[id*=pass i]",
-        "input[name*=pass i]",
+        "#Password", "input[name=Password]",
+        "input[type=password]", "input[id*=pass i]", "input[name*=pass i]"
     ]
     try:
-        page.wait_for_selector(" , ".join(candidates), timeout=timeout_ms)
+        page.wait_for_selector(" , ".join(user_candidates), timeout=timeout_ms)
         page.wait_for_selector(" , ".join(pw_candidates), timeout=timeout_ms)
         return True
     except PlaywrightTimeoutError:
         return False
 
-
 def _dismiss_timeout_if_present(page) -> bool:
-    """Clear 'Your Session Has Timed Out… Click OK to Continue' if it shows up."""
+    """Handle 'Your Session Has Timed Out … Click OK to Continue'."""
     body = _body_text(page)
     if "Session Has Timed Out" not in body and "OK to Continue" not in body:
         return False
@@ -68,60 +56,95 @@ def _dismiss_timeout_if_present(page) -> bool:
         'input[type=button][value="OK"]',
         'a:has-text("OK")',
         '[role="button"]:has-text("OK")',
+        'button:has-text("Continue")',
+        'a:has-text("Continue")',
     ]:
         try:
             el = page.locator(sel).first
             if el and el.is_visible():
                 el.click()
+                page.wait_for_timeout(300)
                 break
         except Exception:
             pass
 
-    # Some versions use JS alerts
+    # Some pages use a JS dialog
     try:
         page.once("dialog", lambda d: d.accept())
     except Exception:
         pass
 
-    # Ensure we go to the actual logon form
-    _go_to_login(page)
     return True
 
+def _force_to_login(page) -> bool:
+    """
+    Aggressively steer to the real /Account/LogOn page.
+    Returns True if login fields become visible.
+    """
+    for attempt in range(4):
+        bust = int(time.time() * 1000)
+        try:
+            page.goto(f"{LOGOFF_URL}?_={bust}", wait_until="domcontentloaded")
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+        # Try direct navigation to logon
+        try:
+            page.goto(f"{LOGON_URL}&_={bust}", wait_until="domcontentloaded")
+        except Exception:
+            pass
+
+        # If we hit the timeout interstitial on /Home, clear it and try again
+        _dismiss_timeout_if_present(page)
+
+        if _wait_for_any_login_fields(page, timeout_ms=5000):
+            return True
+
+        # If still not on the form, try clicking any visible "Log On / Sign In" link
+        for sel in [
+            'a[href*="/Account/LogOn"]',
+            'a:has-text("Log On")',
+            'a:has-text("Log In")',
+            'a:has-text("Sign In")',
+            'button:has-text("Log On")',
+            'button:has-text("Log In")',
+            'button:has-text("Sign In")',
+        ]:
+            try:
+                el = page.locator(sel).first
+                if el and el.is_visible():
+                    el.click()
+                    page.wait_for_timeout(400)
+                    if _wait_for_any_login_fields(page, timeout_ms=4000):
+                        return True
+            except Exception:
+                pass
+
+        # As a last nudge, tell the browser to set location via JS (bypasses some client scripts)
+        try:
+            page.evaluate("location.href = arguments[0]", f"{LOGON_URL}&__={bust}")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+    # If we reach here, we couldn't surface the login fields
+    dbg(f"login DEBUG — url now: {page.url}")
+    dbg(f"login DEBUG — body: {_trim(_body_text(page), 240)}")
+    return False
+
+# ---------------------- login / switch / scrape ----------------------
 
 def login(page, username: str, password: str) -> None:
-    """
-    Very defensive login:
-      • Force a logoff
-      • Go to /Account/LogOn
-      • Dismiss timeout interstitials
-      • Fall back to generic selectors if specific IDs aren't found
-    """
-    # Hard reset server-side session
+    # Start from home (what you already do), then force to login page
     try:
-        page.goto(LOGOFF_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(300)
+        page.goto(PORTAL_HOME, wait_until="domcontentloaded")
     except Exception:
         pass
 
-    _go_to_login(page)
-
-    # If we landed on a timeout screen, clear it
-    _dismiss_timeout_if_present(page)
-
-    # Try a couple of times to find the fields
-    login_visible = _wait_for_any_login_fields(page, timeout_ms=9000)
-    if not login_visible:
-        # Sometimes the site dumps us on /Home with message; try to clear and return again
-        try:
-            page.goto(PORTAL_HOME, wait_until="domcontentloaded")
-        except Exception:
-            pass
-        _dismiss_timeout_if_present(page)
-        _go_to_login(page)
-        login_visible = _wait_for_any_login_fields(page, timeout_ms=9000)
-
-    dbg(f"login fields visible: {login_visible}")
-    if not login_visible:
+    visible = _force_to_login(page)
+    dbg(f"login fields visible: {visible}")
+    if not visible:
         raise RuntimeError("Login form not found — cannot proceed.")
 
     # Fill username
@@ -143,7 +166,6 @@ def login(page, username: str, password: str) -> None:
             pass
 
     # Submit
-    clicked = False
     for sel in [
         'button[type=submit]',
         'input[type=submit]',
@@ -156,44 +178,36 @@ def login(page, username: str, password: str) -> None:
     ]:
         try:
             page.locator(sel).first.click()
-            clicked = True
             break
         except Exception:
             pass
-    if not clicked:
-        # As a last resort, press Enter in the password field
-        try:
-            page.keyboard.press("Enter")
-        except Exception:
-            pass
+    try:
+        page.keyboard.press("Enter")
+    except Exception:
+        pass
 
-    # Wait until the portal home (or obvious banner) shows up
-    deadline = time.time() + 25
+    # Wait until we appear to be inside the portal
+    deadline = time.time() + 20
     while time.time() < deadline:
         try:
-            page.wait_for_load_state("domcontentloaded", timeout=1500)
+            page.wait_for_load_state("domcontentloaded", timeout=1200)
         except Exception:
             pass
         cur = page.url
         if cur.startswith(PORTAL_HOME) or re.search(r"/Home/PortalMainPage", cur, re.I):
             break
-        # Also accept visible markers
         for sel in ["#divStudentBanner", "#dvStudentBanner", "#divStudentInfo"]:
             try:
                 if page.locator(sel).first.is_visible():
                     return
             except Exception:
                 pass
-        time.sleep(0.4)
+        time.sleep(0.3)
 
     dbg("after login: portal loaded")
 
-
-# ---------- student switching ------------------------------------------------
-
 def _casefold(s: str) -> str:
     return (s or "").casefold()
-
 
 def _banner_text(page) -> str:
     for sel in ["#divStudentBanner", "#dvStudentBanner", "#divStudentInfo", "header", "body"]:
@@ -204,22 +218,18 @@ def _banner_text(page) -> str:
             pass
     return ""
 
-
 def switch_to_student(page, student: str) -> bool:
-    """Try tiles, then dropdown/combobox, then any link with the student's name."""
     name_cf = _casefold(student)
     try:
         page.goto(PORTAL_HOME, wait_until="domcontentloaded")
     except Exception:
         pass
 
-    # 1) Tiles/cards
+    # tiles/cards
     for sel in [
-        ".studentTile a",
-        ".studentTile",
+        ".studentTile a", ".studentTile",
         "a.card, .card a, .tile a, .tile",
-        f"a:has-text('{student}')",
-        f"div:has-text('{student}')",
+        f"a:has-text('{student}')", f"div:has-text('{student}')",
     ]:
         try:
             locs = page.locator(sel)
@@ -241,7 +251,7 @@ def switch_to_student(page, student: str) -> bool:
         except Exception:
             pass
 
-    # 2) Dropdown
+    # dropdown
     for sel in ["select#ddlStudent", "select[name*=Student]", "select:has(option)", "[role=combobox]"]:
         try:
             el = page.locator(sel).first
@@ -249,7 +259,6 @@ def switch_to_student(page, student: str) -> bool:
                 try:
                     el.select_option(label=re.compile(student, re.I))
                 except Exception:
-                    # fallback: iterate options
                     options = el.locator("option")
                     for i in range(options.count()):
                         txt = options.nth(i).inner_text(timeout=500)
@@ -266,7 +275,7 @@ def switch_to_student(page, student: str) -> bool:
         except Exception:
             pass
 
-    # 3) Any link with the name
+    # generic link
     try:
         link = page.locator(f"a:has-text('{student}')").first
         if link and link.is_visible():
@@ -282,20 +291,15 @@ def switch_to_student(page, student: str) -> bool:
 
     return False
 
-
-# ---------- assignment scraping ---------------------------------------------
-
 def ensure_assignments_ready(page) -> Tuple[bool, int]:
-    """Wait until we either see assignment tables or a 'No Assignments Available' message."""
     try:
         page.wait_for_selector('table[id^="tblAssign_"]', timeout=10000)
         return True, page.locator('table[id^="tblAssign_"]').count()
     except PlaywrightTimeoutError:
-        txt = _body_text(page, timeout=800)
+        txt = _body_text(page, timeout=900)
         if "No Assignments Available" in txt:
             return True, 0
         return False, 0
-
 
 def _read_headers(table) -> List[str]:
     headers = []
@@ -309,7 +313,6 @@ def _read_headers(table) -> List[str]:
         except Exception:
             headers = []
     return headers
-
 
 HEADER_MAP = {
     "period": "Period",
@@ -332,26 +335,16 @@ HEADER_MAP = {
 }
 
 OUR_COLS = [
-    "Student",
-    "Period",
-    "Course",
-    "Teacher",
-    "DueDate",
-    "AssignedDate",
-    "Assignment",
-    "PtsPossible",
-    "Score",
-    "Pct",
-    "Status",
-    "Comments",
-    "SourceURL",
+    "Student", "Period", "Course", "Teacher",
+    "DueDate", "AssignedDate", "Assignment",
+    "PtsPossible", "Score", "Pct", "Status",
+    "Comments", "SourceURL",
 ]
-
 
 def _normalize_headers(raw_headers: Iterable[str]) -> Dict[int, str]:
     mapping: Dict[int, str] = {}
     for idx, h in enumerate(raw_headers):
-        key = _casefold(re.sub(r"\s+", " ", h.strip()))
+        key = (re.sub(r"\s+", " ", h.strip()) or "").casefold()
         norm = HEADER_MAP.get(key)
         if not norm:
             for k, v in HEADER_MAP.items():
@@ -362,7 +355,6 @@ def _normalize_headers(raw_headers: Iterable[str]) -> Dict[int, str]:
             mapping[idx] = norm
     return mapping
 
-
 def extract_assignments_for_student(page, student: str) -> Tuple[List[List[str]], int]:
     ok, table_count = ensure_assignments_ready(page)
     if not ok:
@@ -371,7 +363,7 @@ def extract_assignments_for_student(page, student: str) -> Tuple[List[List[str]]
     rows: List[List[str]] = []
     tables = page.locator('table[id^="tblAssign_"]')
 
-    # Log table IDs for visibility
+    # log table IDs to help debugging different pages
     try:
         ids = []
         for i in range(tables.count()):
@@ -409,9 +401,6 @@ def extract_assignments_for_student(page, student: str) -> Tuple[List[List[str]]
             rows.append([d[k] for k in OUR_COLS])
 
     return rows, table_count
-
-
-# ---------- Orchestrator -----------------------------------------------------
 
 def run_scrape(username: str, password: str, students: List[str]) -> Tuple[List[List[str]], Dict[str, int]]:
     all_rows: List[List[str]] = []
